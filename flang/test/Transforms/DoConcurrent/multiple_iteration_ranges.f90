@@ -1,11 +1,20 @@
 ! Tests mapping of a `do concurrent` loop with multiple iteration ranges.
 
-! RUN: %flang_fc1 -emit-hlfir -fopenmp -fdo-concurrent-parallel=host %s -o - \
+! RUN: split-file %s %t
+
+! RUN: %flang_fc1 -emit-hlfir -fopenmp -fdo-concurrent-parallel=host %t/multi_range.f90 -o - \
 ! RUN:   | FileCheck %s --check-prefixes=HOST,COMMON
 
-! RUN: %flang_fc1 -emit-hlfir -fopenmp -fdo-concurrent-parallel=device %s -o - \
+! RUN: %flang_fc1 -emit-hlfir -fopenmp -fdo-concurrent-parallel=device %t/multi_range.f90 -o - \
 ! RUN:   | FileCheck %s --check-prefixes=DEVICE,COMMON
 
+! RUN: %flang_fc1 -emit-hlfir -fopenmp -fdo-concurrent-parallel=host %t/perfectly_nested.f90 -o - \
+! RUN:   | FileCheck %s --check-prefixes=HOST,COMMON
+
+! RUN: %flang_fc1 -emit-hlfir -fopenmp -fdo-concurrent-parallel=device %t/perfectly_nested.f90 -o - \
+! RUN:   | FileCheck %s --check-prefixes=DEVICE,COMMON
+
+!--- multi_range.f90
 program main
    integer, parameter :: n = 10
    integer, parameter :: m = 20
@@ -17,6 +26,23 @@ program main
        a(i,j,k) = i * j + k
    end do
 end 
+
+!--- perfectly_nested.f90
+program main
+   integer, parameter :: n = 10
+   integer, parameter :: m = 20
+   integer, parameter :: l = 30
+   integer x;
+   integer :: a(n, m, l)
+
+   do concurrent(i=1:n)
+     do concurrent(j=1:m)
+       do concurrent(k=1:l)
+         a(i,j,k) = i * j + k
+       end do
+     end do
+   end do
+end
 
 ! DEVICE: omp.target
 ! DEVICE: omp.teams
