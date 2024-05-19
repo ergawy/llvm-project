@@ -157,8 +157,10 @@ class DoConcurrentConversion : public mlir::OpConversionPattern<fir::DoLoopOp> {
 public:
   using mlir::OpConversionPattern<fir::DoLoopOp>::OpConversionPattern;
 
-  DoConcurrentConversion(mlir::MLIRContext *context, bool mapToDevice)
-      : OpConversionPattern(context), mapToDevice(mapToDevice) {}
+  DoConcurrentConversion(mlir::MLIRContext *context, bool mapToDevice,
+                         llvm::DenseSet<fir::DoLoopOp> &concurrentLoopsToSkip)
+      : OpConversionPattern(context), mapToDevice(mapToDevice),
+        concurrentLoopsToSkip(concurrentLoopsToSkip) {}
 
   llvm::SetVector<mlir::Operation *>
   extractIndVarUpdateOps(fir::DoLoopOp outerLoop) const {
@@ -189,6 +191,122 @@ public:
     return std::move(indVarUpdateOps);
   }
 
+  mlir::LogicalResult
+  matchAndRewrite(fir::DoLoopOp doLoop, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    mlir::Operation *lbOp = doLoop.getLowerBound().getDefiningOp();
+    mlir::Operation *ubOp = doLoop.getUpperBound().getDefiningOp();
+    mlir::Operation *stepOp = doLoop.getStep().getDefiningOp();
+
+    if (lbOp == nullptr || ubOp == nullptr || stepOp == nullptr) {
+      return rewriter.notifyMatchFailure(
+          doLoop, "At least one of the loop's LB, UB, or step doesn't have a "
+                  "defining operation.");
+    }
+
+    std::function<bool(mlir::Operation *)> isOpUltimatelyConstant =
+        [&](mlir::Operation *operation) {
+          if (mlir::isa_and_present<mlir::arith::ConstantOp>(operation))
+            return true;
+
+          if (auto convertOp =
+                  mlir::dyn_cast_if_present<fir::ConvertOp>(operation))
+            return isOpUltimatelyConstant(convertOp.getValue().getDefiningOp());
+
+          return false;
+        };
+
+    if (!isOpUltimatelyConstant(lbOp) || !isOpUltimatelyConstant(ubOp) ||
+        !isOpUltimatelyConstant(stepOp)) {
+      return rewriter.notifyMatchFailure(
+          doLoop, "`do concurrent` conversion is currently only supported for "
+                  "constant LB, UB, and step values.");
+    }
+
+    llvm::SmallVector<mlir::Value> outermostLoopLives;
+    collectLoopLiveIns(doLoop, outermostLoopLives);
+    assert(!outermostLoopLives.empty());
+
+    LoopNestToIndVarMap loopNest;
+    bool shouldSkipInnerLoops =
+        failed(collectLoopNest(doLoop, outermostLoopLives, loopNest));
+
+    preprocessLoopNest(rewriter, loopNest);
+
+    mlir::IRMapping mapper;
+    mlir::omp::TargetOp targetOp;
+    mlir::omp::LoopNestClauseOps loopNestClauseOps;
+
+    if (mapToDevice) {
+      mlir::omp::TargetClauseOps clauseOps;
+
+      // The outermost loop will contain all the live-in values in all nested
+      // loops since live-in values are collected recursively for all nested
+      // ops.
+      for (mlir::Value liveIn : outermostLoopLives)
+        clauseOps.mapVars.push_back(genMapInfoOpForLiveIn(rewriter, liveIn));
+
+      targetOp = genTargetOp(doLoop.getLoc(), rewriter, mapper,
+                             outermostLoopLives, clauseOps);
+      genTeamsOp(doLoop.getLoc(), rewriter, loopNest, mapper,
+                 loopNestClauseOps);
+      genDistributeOp(doLoop.getLoc(), rewriter);
+    }
+
+    genParallelOp(doLoop.getLoc(), rewriter, loopNest, mapper,
+                  loopNestClauseOps);
+    mlir::omp::LoopNestOp ompLoopNest =
+        genWsLoopOp(rewriter, loopNest.back().first, mapper, loopNestClauseOps);
+
+    // Now that we created the nested `ws.loop` op, we set can the `target` op's
+    // trip count.
+    if (mapToDevice) {
+      rewriter.setInsertionPoint(targetOp);
+      auto parentModule = doLoop->getParentOfType<mlir::ModuleOp>();
+      fir::FirOpBuilder firBuilder(rewriter, fir::getKindMapping(parentModule));
+
+      mlir::omp::CollapseClauseOps collapseClauseOps;
+      collapseClauseOps.loopLBVar.push_back(lbOp->getResult(0));
+      collapseClauseOps.loopUBVar.push_back(ubOp->getResult(0));
+      collapseClauseOps.loopStepVar.push_back(stepOp->getResult(0));
+
+      mlir::cast<mlir::omp::TargetOp>(targetOp).getTripCountMutable().assign(
+          Fortran::lower::omp::calculateTripCount(firBuilder, doLoop.getLoc(),
+                                                  collapseClauseOps));
+    }
+
+    rewriter.eraseOp(doLoop);
+
+    if (shouldSkipInnerLoops)
+      ompLoopNest->walk([&](fir::DoLoopOp doLoop) {
+        if (doLoop.getUnordered()) {
+          llvm::SmallVector<mlir::Value> loopLiveIns;
+          collectLoopLiveIns(doLoop, loopLiveIns);
+
+          InductionVariableInfo ivInfo{
+              loopLiveIns.front().getDefiningOp(),
+              std::move(extractIndVarUpdateOps(doLoop))};
+
+          mlir::IRRewriter::InsertPoint ip = rewriter.saveInsertionPoint();
+          rewriter.setInsertionPoint(doLoop);
+
+          mlir::Operation *privatizedIVMemDef =
+              genInductionVariableAlloc(rewriter, ivInfo.iterVarMemDef, mapper);
+          ivInfo.iterVarMemDef->replaceUsesWithIf(
+              privatizedIVMemDef, [&](mlir::OpOperand &operand) {
+                return operand.getOwner()->getParentOp() == doLoop;
+              });
+
+          rewriter.restoreInsertionPoint(ip);
+
+          concurrentLoopsToSkip.insert(doLoop);
+        }
+      });
+
+    return mlir::success();
+  }
+
+private:
   mlir::LogicalResult
   collectLoopNest(fir::DoLoopOp outerLoop,
                   const llvm::SmallVectorImpl<mlir::Value> &outerLoopLiveIns,
@@ -326,95 +444,6 @@ public:
     }
   }
 
-  mlir::LogicalResult
-  matchAndRewrite(fir::DoLoopOp doLoop, OpAdaptor adaptor,
-                  mlir::ConversionPatternRewriter &rewriter) const override {
-    mlir::Operation *lbOp = doLoop.getLowerBound().getDefiningOp();
-    mlir::Operation *ubOp = doLoop.getUpperBound().getDefiningOp();
-    mlir::Operation *stepOp = doLoop.getStep().getDefiningOp();
-
-    if (lbOp == nullptr || ubOp == nullptr || stepOp == nullptr) {
-      return rewriter.notifyMatchFailure(
-          doLoop, "At least one of the loop's LB, UB, or step doesn't have a "
-                  "defining operation.");
-    }
-
-    std::function<bool(mlir::Operation *)> isOpUltimatelyConstant =
-        [&](mlir::Operation *operation) {
-          if (mlir::isa_and_present<mlir::arith::ConstantOp>(operation))
-            return true;
-
-          if (auto convertOp =
-                  mlir::dyn_cast_if_present<fir::ConvertOp>(operation))
-            return isOpUltimatelyConstant(convertOp.getValue().getDefiningOp());
-
-          return false;
-        };
-
-    if (!isOpUltimatelyConstant(lbOp) || !isOpUltimatelyConstant(ubOp) ||
-        !isOpUltimatelyConstant(stepOp)) {
-      return rewriter.notifyMatchFailure(
-          doLoop, "`do concurrent` conversion is currently only supported for "
-                  "constant LB, UB, and step values.");
-    }
-
-    llvm::SmallVector<mlir::Value> outermostLoopLives;
-    collectLoopLiveIns(doLoop, outermostLoopLives);
-    assert(!outermostLoopLives.empty());
-
-    LoopNestToIndVarMap loopNest;
-    if (failed(collectLoopNest(doLoop, outermostLoopLives, loopNest))) {
-      // TODO collect loops to skip.
-    }
-
-    preprocessLoopNest(rewriter, loopNest);
-
-    mlir::IRMapping mapper;
-    mlir::omp::TargetOp targetOp;
-    mlir::omp::LoopNestClauseOps loopNestClauseOps;
-
-    if (mapToDevice) {
-      mlir::omp::TargetClauseOps clauseOps;
-
-      // The outermost loop will contain all the live-in values in all nested
-      // loops since live-in values are collected recursively for all nested
-      // ops.
-      for (mlir::Value liveIn : outermostLoopLives)
-        clauseOps.mapVars.push_back(genMapInfoOpForLiveIn(rewriter, liveIn));
-
-      targetOp = genTargetOp(doLoop.getLoc(), rewriter, mapper,
-                             outermostLoopLives, clauseOps);
-      genTeamsOp(doLoop.getLoc(), rewriter, loopNest, mapper,
-                 loopNestClauseOps);
-      genDistributeOp(doLoop.getLoc(), rewriter);
-    }
-
-    genParallelOp(doLoop.getLoc(), rewriter, loopNest, mapper,
-                  loopNestClauseOps);
-    genWsLoopOp(rewriter, loopNest.back().first, mapper, loopNestClauseOps);
-
-    // Now that we created the nested `ws.loop` op, we set can the `target` op's
-    // trip count.
-    if (mapToDevice) {
-      rewriter.setInsertionPoint(targetOp);
-      auto parentModule = doLoop->getParentOfType<mlir::ModuleOp>();
-      fir::FirOpBuilder firBuilder(rewriter, fir::getKindMapping(parentModule));
-
-      mlir::omp::CollapseClauseOps collapseClauseOps;
-      collapseClauseOps.loopLBVar.push_back(lbOp->getResult(0));
-      collapseClauseOps.loopUBVar.push_back(ubOp->getResult(0));
-      collapseClauseOps.loopStepVar.push_back(stepOp->getResult(0));
-
-      mlir::cast<mlir::omp::TargetOp>(targetOp).getTripCountMutable().assign(
-          Fortran::lower::omp::calculateTripCount(firBuilder, doLoop.getLoc(),
-                                                  collapseClauseOps));
-    }
-
-    rewriter.eraseOp(doLoop);
-    return mlir::success();
-  }
-
-private:
   /// Collect the list of values used inside the loop but defined outside of it.
   /// The first item in the returned list is always the loop's induction
   /// variable.
@@ -717,9 +746,10 @@ private:
       genInductionVariableAlloc(rewriter, indVarInfo.iterVarMemDef, mapper);
   }
 
-  void genInductionVariableAlloc(mlir::ConversionPatternRewriter &rewriter,
-                                 mlir::Operation *indVarMemDef,
-                                 mlir::IRMapping &mapper) const {
+  mlir::Operation *
+  genInductionVariableAlloc(mlir::ConversionPatternRewriter &rewriter,
+                            mlir::Operation *indVarMemDef,
+                            mlir::IRMapping &mapper) const {
     assert(
         indVarMemDef != nullptr &&
         "Induction variable memdef is expected to have a defining operation.");
@@ -729,8 +759,11 @@ private:
       indVarDeclareAndAlloc.insert(operand.getDefiningOp());
     indVarDeclareAndAlloc.insert(indVarMemDef);
 
+    mlir::Operation *result;
     for (mlir::Operation *opToClone : indVarDeclareAndAlloc)
-      rewriter.clone(*opToClone, mapper);
+      result = rewriter.clone(*opToClone, mapper);
+
+    return result;
   }
 
   mlir::omp::ParallelOp
@@ -778,6 +811,7 @@ private:
   }
 
   bool mapToDevice;
+  llvm::DenseSet<fir::DoLoopOp> &concurrentLoopsToSkip;
 };
 
 class DoConcurrentConversionPass
@@ -809,17 +843,18 @@ public:
                         "Valid values are: `host` or `device`");
       return;
     }
-
+    llvm::DenseSet<fir::DoLoopOp> concurrentLoopsToSkip;
     mlir::RewritePatternSet patterns(context);
-    patterns.insert<DoConcurrentConversion>(
-        context, mapTo == fir::omp::DoConcurrentMappingKind::DCMK_Device);
+        context, mapTo == fir::omp::DoConcurrentMappingKind::DCMK_Device,
+                                            concurrentLoopsToSkip);
     mlir::ConversionTarget target(*context);
     target.addLegalDialect<fir::FIROpsDialect, hlfir::hlfirDialect,
                            mlir::arith::ArithDialect, mlir::func::FuncDialect,
                            mlir::omp::OpenMPDialect>();
 
-    target.addDynamicallyLegalOp<fir::DoLoopOp>(
-        [](fir::DoLoopOp op) { return !op.getUnordered(); });
+    target.addDynamicallyLegalOp<fir::DoLoopOp>([&](fir::DoLoopOp op) {
+      return !op.getUnordered() || concurrentLoopsToSkip.contains(op);
+    });
 
     if (mlir::failed(mlir::applyFullConversion(getOperation(), target,
                                                std::move(patterns)))) {
