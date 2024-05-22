@@ -25,7 +25,6 @@ program main
    integer, parameter :: n = 10
    integer, parameter :: m = 20
    integer, parameter :: l = 30
-   integer x;
    integer :: a(n, m, l)
 
    do concurrent(i=1:n, j=1:m, k=1:l)
@@ -38,7 +37,6 @@ program main
    integer, parameter :: n = 10
    integer, parameter :: m = 20
    integer, parameter :: l = 30
-   integer x;
    integer :: a(n, m, l)
 
    do concurrent(i=1:n)
@@ -55,7 +53,6 @@ program main
    integer, parameter :: n = 10
    integer, parameter :: m = 20
    integer, parameter :: l = 30
-   integer x;
    integer :: a(n, m, l)
 
    do concurrent(i=1:n, j=1:m)
