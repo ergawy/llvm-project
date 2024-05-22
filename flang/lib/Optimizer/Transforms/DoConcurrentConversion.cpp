@@ -146,6 +146,12 @@ mlir::Value calculateTripCount(fir::FirOpBuilder &builder, mlir::Location loc,
 
 namespace {
 namespace looputils {
+
+/// Collects info needed about the indcution/iteration variable for each `do
+/// concurrent` in a loop nest. This includes:
+/// * the operation allocating memory for iteration variable,
+/// * the operation(s) updating the iteration variable with the current
+///   iteration number.
 struct InductionVariableInfo {
   mlir::Operation *iterVarMemDef;
   llvm::SetVector<mlir::Operation *> indVarUpdateOps;
@@ -154,31 +160,28 @@ struct InductionVariableInfo {
 using LoopNestToIndVarMap =
     llvm::MapVector<fir::DoLoopOp, InductionVariableInfo>;
 
+/// Given an operation `op`, this lambda returns true if `op`'s operand is
+/// ultimately the loop's induction variable. Detecting this helps finding the
+/// live-in value corresponding to the induction variable in case the induction
+/// variable is indirectly used in the loop (e.g. throught a cast op).
+bool isIndVarUltimateOperand(mlir::Operation *op, fir::DoLoopOp doLoop) {
+  if (auto storeOp = mlir::dyn_cast_if_present<fir::StoreOp>(op))
+    return (storeOp.getValue() == doLoop.getInductionVar()) ||
+           isIndVarUltimateOperand(storeOp.getValue().getDefiningOp(), doLoop);
+
+  if (auto convertOp = mlir::dyn_cast_if_present<fir::ConvertOp>(op))
+    return convertOp.getOperand() == doLoop.getInductionVar() ||
+           isIndVarUltimateOperand(convertOp.getValue().getDefiningOp(),
+                                   doLoop);
+
+  return false;
+};
+
 /// Collect the list of values used inside the loop but defined outside of it.
 /// The first item in the returned list is always the loop's induction
 /// variable.
 void collectLoopLiveIns(fir::DoLoopOp doLoop,
                         llvm::SmallVectorImpl<mlir::Value> &liveIns) {
-  // Given an operation `op`, this lambda returns true if `op`'s operand is
-  // ultimately the loop's induction variable. Detecting this helps finding
-  // the live-in value corresponding to the induction variable in case the
-  // induction variable is indirectly used in the loop (e.g. throught a cast
-  // op).
-  std::function<bool(mlir::Operation * op)> isIndVarUltimateOperand =
-      [&](mlir::Operation *op) {
-        if (auto storeOp = mlir::dyn_cast_if_present<fir::StoreOp>(op)) {
-          return (storeOp.getValue() == doLoop.getInductionVar()) ||
-                 isIndVarUltimateOperand(storeOp.getValue().getDefiningOp());
-        }
-
-        if (auto convertOp = mlir::dyn_cast_if_present<fir::ConvertOp>(op)) {
-          return convertOp.getOperand() == doLoop.getInductionVar() ||
-                 isIndVarUltimateOperand(convertOp.getValue().getDefiningOp());
-        }
-
-        return false;
-      };
-
   llvm::SmallDenseSet<mlir::Value> seenValues;
   llvm::SmallDenseSet<mlir::Operation *> seenOps;
 
@@ -194,19 +197,36 @@ void collectLoopLiveIns(fir::DoLoopOp doLoop,
 
         liveIns.push_back(operand->get());
 
-        if (isIndVarUltimateOperand(operand->getOwner()))
+        if (isIndVarUltimateOperand(operand->getOwner(), doLoop))
           std::swap(*liveIns.begin(), *liveIns.rbegin());
       });
 }
-llvm::SetVector<mlir::Operation *>
-extractIndVarUpdateOps(fir::DoLoopOp outerLoop) {
-  mlir::Value indVar = outerLoop.getInductionVar();
 
+/// Collects the op(s) responsible for updating a loop's iteration variable with
+/// the current iteration number. For example, for the input IR:
+/// ```
+/// %i = fir.alloca i32 {bindc_name = "i"}
+/// %i_decl:2 = hlfir.declare %i ...
+/// ...
+/// fir.do_loop %i_iv = %lb to %ub step %step unordered {
+///   %1 = fir.convert %i_iv : (index) -> i32
+///   fir.store %1 to %i_decl#1 : !fir.ref<i32>
+///   ...
+/// }
+/// ```
+/// this function would return the first 2 ops in the `fir.do_loop`'s region.
+llvm::SetVector<mlir::Operation *>
+extractIndVarUpdateOps(fir::DoLoopOp doLoop) {
+  mlir::Value indVar = doLoop.getInductionVar();
+
+  // The list of values related to the indcution variable. These could be the IV
+  // itself of the results of ops where the IV is an operand.
   llvm::DenseSet<mlir::Value> indVarRelatedVals;
+  // We start with the IV as the only item in the list.
   indVarRelatedVals.insert(indVar);
   llvm::SetVector<mlir::Operation *> indVarUpdateOps;
 
-  for (mlir::Operation &op : outerLoop.getRegion().getOps()) {
+  for (mlir::Operation &op : doLoop.getRegion().getOps()) {
     auto opTakesValueAsOperand = [&](mlir::Value value) {
       return llvm::any_of(op.getOperands(), [&](mlir::Value operand) {
         return operand == value;
@@ -218,25 +238,35 @@ extractIndVarUpdateOps(fir::DoLoopOp outerLoop) {
         })) {
       indVarUpdateOps.insert(&op);
 
-      for (mlir::Value result : op.getResults()) {
+      for (mlir::Value result : op.getResults())
         indVarRelatedVals.insert(result);
-      }
     }
   }
 
   return std::move(indVarUpdateOps);
 }
 
+/// Starting with a value and the end of a defintion/conversion chain, walk the
+/// chain backwards and collect all the visited ops along the way. For example,
+/// given this IR:
+/// ```
+/// %c10 = arith.constant 10 : i32
+/// %10 = fir.convert %c10 : (i32) -> index
+/// ```
+/// and giving `%10` as the starting input: `link`, `defChain` would contain
+/// both of the above ops.
 mlir::LogicalResult
 extractDefChain(mlir::Operation *link,
                 llvm::SmallVectorImpl<mlir::Operation *> &defChain) {
-
   if (mlir::isa_and_present<mlir::arith::ConstantOp>(link)) {
     defChain.push_back(link);
+    // A `ConstantOp` marks the beginning of the chain, so we can stop here.
     return mlir::success();
   }
 
   if (auto convertOp = mlir::dyn_cast_if_present<fir::ConvertOp>(link)) {
+    // For a `ConvertOp` we still have links up the chain to walk, so
+    // recursively do so.
     mlir::LogicalResult result =
         extractDefChain(convertOp.getValue().getDefiningOp(), defChain);
 
@@ -253,6 +283,10 @@ extractDefChain(mlir::Operation *link,
   return mlir::emitError(link->getLoc(), opOs.str());
 }
 
+/// Starting with `outerLoop` collect a perfectly nested loop nest, if any. This
+/// function collects as much as possible loops in the nest; it case it fails to
+/// recognize a certain nested loop as part of the nest it just returns the
+/// parent loops it discovered before.
 mlir::LogicalResult
 collectLoopNest(fir::DoLoopOp outerLoop,
                 const llvm::SmallVectorImpl<mlir::Value> &outerLoopLiveIns,
@@ -288,30 +322,6 @@ collectLoopNest(fir::DoLoopOp outerLoop,
                    [](auto *op) { return op == nullptr; }))
     return mlir::failure();
 
-  llvm::SmallDenseSet<mlir::Operation *> preNestedLoopOps;
-
-  auto collectPreNestedLoopOps =
-      [&](mlir::Operation *nestedUnorderedControlOp) {
-        llvm::SmallVector<mlir::Operation *> defChain;
-        mlir::LogicalResult result =
-            extractDefChain(nestedUnorderedControlOp, defChain);
-        if (failed(result))
-          return result;
-
-        for (mlir::Operation *link : defChain)
-          preNestedLoopOps.insert(link);
-
-        return mlir::success();
-      };
-
-  for (mlir::Operation *op : nestedUnorderedControlOps)
-    if (failed(collectPreNestedLoopOps(op))) {
-      mlir::emitWarning(
-          op->getLoc(),
-          "Failed to collect control ops for nested unorderd loop");
-      return mlir::failure();
-    }
-
   llvm::SmallVector<mlir::Value> nestedLiveIns;
   collectLoopLiveIns(nestedUnorderedLoop, nestedLiveIns);
 
@@ -335,7 +345,7 @@ collectLoopNest(fir::DoLoopOp outerLoop,
       outerLoopIV = getUnifiedLiveInView(liveIn);
   }
 
-  // For the 2 loops be perfectly nested, either:
+  // For the 2 loops to be perfectly nested, either:
   // * both would have exactly the same set of live-in values or,
   // * the outer loop would have exactly 1 extra live-in value: the outer
   //   loop's induction variable; this happens when the outer loop's IV is
@@ -369,9 +379,8 @@ void preprocessLoopNest(mlir::ConversionPatternRewriter &rewriter,
   llvm::SmallVector<mlir::Location> argLocs;
 
   for (auto &[doLoop, indVarInfo] : llvm::drop_end(loopNest)) {
-    for (mlir::Operation *op : indVarInfo.indVarUpdateOps) {
+    for (mlir::Operation *op : indVarInfo.indVarUpdateOps)
       op->moveBefore(&innermostFirstOp);
-    }
 
     argTypes.push_back(doLoop.getInductionVar().getType());
     argLocs.push_back(doLoop.getInductionVar().getLoc());
