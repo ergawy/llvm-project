@@ -147,7 +147,7 @@ mlir::Value calculateTripCount(fir::FirOpBuilder &builder, mlir::Location loc,
 namespace {
 namespace looputils {
 
-/// Collects info needed about the indcution/iteration variable for each `do
+/// Stores info needed about the indcution/iteration variable for each `do
 /// concurrent` in a loop nest. This includes:
 /// * the operation allocating memory for iteration variable,
 /// * the operation(s) updating the iteration variable with the current
@@ -328,11 +328,23 @@ collectLoopNest(fir::DoLoopOp outerLoop,
   llvm::DenseSet<mlir::Value> outerLiveInsSet;
   llvm::DenseSet<mlir::Value> nestedLiveInsSet;
 
+  // Returns a "unified" view of an mlir::Value. This utility checks if the
+  // value is defined by an op, and if so, return the first value defined by
+  // that op (if there are many), otherwise just returns the value.
+  //
+  // This serves the purpose that if, for example, `%op_res#0` is used in the
+  // outer loop and `%op_res#1` is used in the nested loop (or vice versa), that
+  // we detect both as the same value. If we did not do so, we might falesely
+  // detect that the 2 loops are not perfectly nested since they use "different"
+  // sets of values.
   auto getUnifiedLiveInView = [](mlir::Value liveIn) {
     return liveIn.getDefiningOp() != nullptr
                ? liveIn.getDefiningOp()->getResult(0)
                : liveIn;
   };
+
+  // Re-package both lists of live-ins into sets so that we can use set equality
+  // to compare the values used in the outerloop vs. the nestd one.
 
   for (auto liveIn : nestedLiveIns)
     nestedLiveInsSet.insert(getUnifiedLiveInView(liveIn));
@@ -341,6 +353,8 @@ collectLoopNest(fir::DoLoopOp outerLoop,
   for (auto liveIn : outerLoopLiveIns) {
     outerLiveInsSet.insert(getUnifiedLiveInView(liveIn));
 
+    // Keep track of the IV of the outerloop. See `isPerfectlyNested` for more
+    // info on the reason.
     if (outerLoopIV == nullptr)
       outerLoopIV = getUnifiedLiveInView(liveIn);
   }
