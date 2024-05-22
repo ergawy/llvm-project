@@ -381,6 +381,53 @@ collectLoopNest(fir::DoLoopOp outerLoop,
   return collectLoopNest(nestedUnorderedLoop, nestedLiveIns, loopNest);
 }
 
+/// Prepares the `fir.do_loop` nest to be easily mapped to OpenMP. In
+/// particular, this function would take this input IR:
+/// ```
+/// fir.do_loop %i_iv = %i_lb to %i_ub step %i_step unordered {
+///   fir.store %i_iv to %i#1 : !fir.ref<i32>
+///   %j_lb = arith.constant 1 : i32
+///   %j_ub = arith.constant 10 : i32
+///   %j_step = arith.constant 1 : index
+///
+///   fir.do_loop %j_iv = %j_lb to %j_ub step %j_step unordered {
+///     fir.store %j_iv to %j#1 : !fir.ref<i32>
+///     ...
+///   }
+/// }
+/// ```
+///
+/// into the following form (using generic op form since the result is
+/// technically an invalid `fir.do_loop` op:
+///
+/// ```
+/// "fir.do_loop"(%i_lb, %i_ub, %i_step) <{unordered}> ({
+/// ^bb0(%i_iv: index):
+///   %j_lb = "arith.constant"() <{value = 1 : i32}> : () -> i32
+///   %j_ub = "arith.constant"() <{value = 10 : i32}> : () -> i32
+///   %j_step = "arith.constant"() <{value = 1 : index}> : () -> index
+///
+///   "fir.do_loop"(%j_lb, %j_ub, %j_step) <{unordered}> ({
+///   ^bb0(%new_i_iv: index, %new_j_iv: index):
+///     "fir.store"(%new_i_iv, %i#1) : (i32, !fir.ref<i32>) -> ()
+///     "fir.store"(%new_j_iv, %j#1) : (i32, !fir.ref<i32>) -> ()
+///     ...
+///   })
+/// ```
+///
+/// What happened to the loop nest is the following:
+///
+/// * the innermost loop's entry block was updated from having one operand to
+///   having `n` operands where `n` is the number of loops in the nest,
+///
+/// * the outer loop(s)' ops that update the IVs were sank inside the innermost
+///   loop (see the `"fir.store"(%new_i_iv, %i#1)` op above),
+///
+/// * the innermost loop's entry block's arguments were mapped in order from the
+///   outermost to the innermost IV.
+///
+/// With this IR change, we can directly inline the innermost loop's region into
+/// the newly generated `omp.loop_nest` op.
 void preprocessLoopNest(mlir::ConversionPatternRewriter &rewriter,
                         looputils::LoopNestToIndVarMap &loopNest) {
   if (loopNest.size() <= 1)
@@ -393,6 +440,8 @@ void preprocessLoopNest(mlir::ConversionPatternRewriter &rewriter,
   llvm::SmallVector<mlir::Location> argLocs;
 
   for (auto &[doLoop, indVarInfo] : llvm::drop_end(loopNest)) {
+    // Sink the IV update ops to the innermost loop. We need to do for all loops
+    // except for the innermost one, hence the `drop_end` usage above.
     for (mlir::Operation *op : indVarInfo.indVarUpdateOps)
       op->moveBefore(&innermostFirstOp);
 
@@ -401,14 +450,24 @@ void preprocessLoopNest(mlir::ConversionPatternRewriter &rewriter,
   }
 
   mlir::Region &innermmostRegion = innermostLoop.getRegion();
+  // Extend the innermost entry block with arguments to represent the outer IVs.
   innermmostRegion.addArguments(argTypes, argLocs);
 
   unsigned idx = 1;
+  // In reverse, remap the IVs of the loop nest from the old values to the new
+  // ones. We do that in reverse since the first argument before this loop is
+  // the old IV for the innermost loop. Therefore, we want to replace it first
+  // before the old value (1st argument in the block) is remapped to be the IV
+  // of the outermost loop in the nest.
   for (auto &[doLoop, _] : llvm::reverse(loopNest)) {
     doLoop.getInductionVar().replaceAllUsesWith(
         innermmostRegion.getArgument(innermmostRegion.getNumArguments() - idx));
     ++idx;
   }
+
+  loopNest.front().first->print(
+      llvm::errs(),
+      mlir::OpPrintingFlags().assumeVerified().printGenericOpForm());
 }
 } // namespace looputils
 
@@ -514,6 +573,13 @@ public:
   }
 
 private:
+  /// For loops that are not perfectly nested, we need to do 2 things:
+  /// 1. Privatize the memory definition/allocation of their iteration variables
+  ///    since these would cross the boundaries of the target/parallel region
+  ///    after mapping to OpenMP.
+  /// 2. Mark these loops to be skipped from the legality check of the
+  ///    `ConversionTarget` since we are not interested in mapping them to
+  ///    OpenMP.
   void processNotPerfectlyNestedLoops(mlir::ConversionPatternRewriter &rewriter,
                                       mlir::IRMapping &mapper,
                                       mlir::omp::LoopNestOp ompLoopNest) const {
