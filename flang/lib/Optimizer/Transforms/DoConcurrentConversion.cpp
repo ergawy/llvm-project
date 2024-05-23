@@ -147,7 +147,7 @@ mlir::Value calculateTripCount(fir::FirOpBuilder &builder, mlir::Location loc,
 namespace {
 namespace looputils {
 
-/// Stores info needed about the indcution/iteration variable for each `do
+/// Stores info needed about the induction/iteration variable for each `do
 /// concurrent` in a loop nest. This includes:
 /// * the operation allocating memory for iteration variable,
 /// * the operation(s) updating the iteration variable with the current
@@ -160,10 +160,10 @@ struct InductionVariableInfo {
 using LoopNestToIndVarMap =
     llvm::MapVector<fir::DoLoopOp, InductionVariableInfo>;
 
-/// Given an operation `op`, this lambda returns true if `op`'s operand is
-/// ultimately the loop's induction variable. Detecting this helps finding the
-/// live-in value corresponding to the induction variable in case the induction
-/// variable is indirectly used in the loop (e.g. throught a cast op).
+/// Given an operation `op`, this returns true if `op`'s operand is ultimately
+/// the loop's induction variable. Detecting this helps finding the live-in
+/// value corresponding to the induction variable in case the induction variable
+/// is indirectly used in the loop (e.g. throught a cast op).
 bool isIndVarUltimateOperand(mlir::Operation *op, fir::DoLoopOp doLoop) {
   if (auto storeOp = mlir::dyn_cast_if_present<fir::StoreOp>(op))
     return (storeOp.getValue() == doLoop.getInductionVar()) ||
@@ -219,7 +219,7 @@ llvm::SetVector<mlir::Operation *>
 extractIndVarUpdateOps(fir::DoLoopOp doLoop) {
   mlir::Value indVar = doLoop.getInductionVar();
 
-  // The list of values related to the indcution variable. These could be the IV
+  // The list of values related to the induction variable. These could be the IV
   // itself of the results of ops where the IV is an operand.
   llvm::DenseSet<mlir::Value> indVarRelatedVals;
   // We start with the IV as the only item in the list.
