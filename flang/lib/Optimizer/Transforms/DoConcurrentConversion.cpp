@@ -310,16 +310,9 @@ mlir::LogicalResult collectLoopNest(fir::DoLoopOp outerLoop,
 
     fir::DoLoopOp nestedUnorderedLoop = unorderedLoops.front();
 
-    std::array<mlir::Operation *, 3> nestedUnorderedControlOps;
-    nestedUnorderedControlOps[0] =
-        nestedUnorderedLoop.getLowerBound().getDefiningOp();
-    nestedUnorderedControlOps[1] =
-        nestedUnorderedLoop.getUpperBound().getDefiningOp();
-    nestedUnorderedControlOps[2] =
-        nestedUnorderedLoop.getStep().getDefiningOp();
-
-    if (llvm::any_of(nestedUnorderedControlOps,
-                     [](auto *op) { return op == nullptr; }))
+    if ((nestedUnorderedLoop.getLowerBound().getDefiningOp() == nullptr) ||
+        (nestedUnorderedLoop.getUpperBound().getDefiningOp() == nullptr) ||
+        (nestedUnorderedLoop.getStep().getDefiningOp() == nullptr))
       return mlir::failure();
 
     llvm::SmallVector<mlir::Value> nestedLiveIns;
