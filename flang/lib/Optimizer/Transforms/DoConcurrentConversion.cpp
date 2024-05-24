@@ -146,7 +146,6 @@ mlir::Value calculateTripCount(fir::FirOpBuilder &builder, mlir::Location loc,
 
 namespace {
 namespace looputils {
-
 /// Stores info needed about the induction/iteration variable for each `do
 /// concurrent` in a loop nest. This includes:
 /// * the operation allocating memory for iteration variable,
@@ -464,10 +463,6 @@ void preprocessLoopNest(mlir::ConversionPatternRewriter &rewriter,
         innermmostRegion.getArgument(innermmostRegion.getNumArguments() - idx));
     ++idx;
   }
-
-  loopNest.front().first->print(
-      llvm::errs(),
-      mlir::OpPrintingFlags().assumeVerified().printGenericOpForm());
 }
 } // namespace looputils
 
@@ -517,7 +512,7 @@ public:
     assert(!outermostLoopLives.empty());
 
     looputils::LoopNestToIndVarMap loopNest;
-    bool shouldSkipInnerLoops = failed(
+    bool hasRemainingNestedLoops = failed(
         looputils::collectLoopNest(doLoop, outermostLoopLives, loopNest));
 
     looputils::preprocessLoopNest(rewriter, loopNest);
@@ -566,7 +561,7 @@ public:
 
     rewriter.eraseOp(doLoop);
 
-    if (shouldSkipInnerLoops)
+    if (hasRemainingNestedLoops)
       processNotPerfectlyNestedLoops(rewriter, mapper, ompLoopNest);
 
     return mlir::success();
