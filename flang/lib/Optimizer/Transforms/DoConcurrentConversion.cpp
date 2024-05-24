@@ -217,28 +217,25 @@ void collectLoopLiveIns(fir::DoLoopOp doLoop,
 llvm::SetVector<mlir::Operation *>
 extractIndVarUpdateOps(fir::DoLoopOp doLoop) {
   mlir::Value indVar = doLoop.getInductionVar();
-
-  // The list of values related to the induction variable. These could be the IV
-  // itself of the results of ops where the IV is an operand.
-  llvm::DenseSet<mlir::Value> indVarRelatedVals;
-  // We start with the IV as the only item in the list.
-  indVarRelatedVals.insert(indVar);
   llvm::SetVector<mlir::Operation *> indVarUpdateOps;
 
-  for (mlir::Operation &op : doLoop.getRegion().getOps()) {
-    auto opTakesValueAsOperand = [&](mlir::Value value) {
-      return llvm::any_of(op.getOperands(), [&](mlir::Value operand) {
-        return operand == value;
-      });
-    };
+  llvm::SmallVector<mlir::Value> toProcess;
+  toProcess.push_back(indVar);
 
-    if (llvm::any_of(indVarRelatedVals, [&](mlir::Value value) {
-          return opTakesValueAsOperand(value);
-        })) {
-      indVarUpdateOps.insert(&op);
+  llvm::DenseSet<mlir::Value> done;
 
-      for (mlir::Value result : op.getResults())
-        indVarRelatedVals.insert(result);
+  while (!toProcess.empty()) {
+    mlir::Value val = toProcess.back();
+    toProcess.pop_back();
+
+    if (!done.insert(val).second)
+      continue;
+
+    for (mlir::Operation *user : val.getUsers()) {
+      indVarUpdateOps.insert(user);
+
+      for (mlir::Value result : user->getResults())
+        toProcess.push_back(result);
     }
   }
 
@@ -286,98 +283,106 @@ extractDefChain(mlir::Operation *link,
 /// function collects as much as possible loops in the nest; it case it fails to
 /// recognize a certain nested loop as part of the nest it just returns the
 /// parent loops it discovered before.
-mlir::LogicalResult
-collectLoopNest(fir::DoLoopOp outerLoop,
-                const llvm::SmallVectorImpl<mlir::Value> &outerLoopLiveIns,
-                LoopNestToIndVarMap &loopNest) {
-  loopNest.try_emplace(
-      outerLoop, InductionVariableInfo{
-                     outerLoopLiveIns.front().getDefiningOp(),
-                     std::move(looputils::extractIndVarUpdateOps(outerLoop))});
+mlir::LogicalResult collectLoopNest(fir::DoLoopOp outerLoop,
+                                    LoopNestToIndVarMap &loopNest) {
+  llvm::SmallVector<mlir::Value> outerLoopLiveIns;
+  collectLoopLiveIns(outerLoop, outerLoopLiveIns);
 
-  auto directlyNestedLoops = outerLoop.getRegion().getOps<fir::DoLoopOp>();
-  llvm::SmallVector<fir::DoLoopOp> unorderedLoops;
+  while (true) {
+    loopNest.try_emplace(
+        outerLoop,
+        InductionVariableInfo{
+            outerLoopLiveIns.front().getDefiningOp(),
+            std::move(looputils::extractIndVarUpdateOps(outerLoop))});
 
-  for (auto nestedLoop : directlyNestedLoops)
-    if (nestedLoop.getUnordered())
-      unorderedLoops.push_back(nestedLoop);
+    auto directlyNestedLoops = outerLoop.getRegion().getOps<fir::DoLoopOp>();
+    llvm::SmallVector<fir::DoLoopOp> unorderedLoops;
 
-  if (unorderedLoops.empty())
-    return mlir::success();
+    for (auto nestedLoop : directlyNestedLoops)
+      if (nestedLoop.getUnordered())
+        unorderedLoops.push_back(nestedLoop);
 
-  if (unorderedLoops.size() > 1)
-    return mlir::failure();
+    if (unorderedLoops.empty())
+      break;
 
-  fir::DoLoopOp nestedUnorderedLoop = unorderedLoops.front();
+    if (unorderedLoops.size() > 1)
+      return mlir::failure();
 
-  std::array<mlir::Operation *, 3> nestedUnorderedControlOps;
-  nestedUnorderedControlOps[0] =
-      nestedUnorderedLoop.getLowerBound().getDefiningOp();
-  nestedUnorderedControlOps[1] =
-      nestedUnorderedLoop.getUpperBound().getDefiningOp();
-  nestedUnorderedControlOps[2] = nestedUnorderedLoop.getStep().getDefiningOp();
+    fir::DoLoopOp nestedUnorderedLoop = unorderedLoops.front();
 
-  if (llvm::any_of(nestedUnorderedControlOps,
-                   [](auto *op) { return op == nullptr; }))
-    return mlir::failure();
+    std::array<mlir::Operation *, 3> nestedUnorderedControlOps;
+    nestedUnorderedControlOps[0] =
+        nestedUnorderedLoop.getLowerBound().getDefiningOp();
+    nestedUnorderedControlOps[1] =
+        nestedUnorderedLoop.getUpperBound().getDefiningOp();
+    nestedUnorderedControlOps[2] =
+        nestedUnorderedLoop.getStep().getDefiningOp();
 
-  llvm::SmallVector<mlir::Value> nestedLiveIns;
-  collectLoopLiveIns(nestedUnorderedLoop, nestedLiveIns);
+    if (llvm::any_of(nestedUnorderedControlOps,
+                     [](auto *op) { return op == nullptr; }))
+      return mlir::failure();
 
-  llvm::DenseSet<mlir::Value> outerLiveInsSet;
-  llvm::DenseSet<mlir::Value> nestedLiveInsSet;
+    llvm::SmallVector<mlir::Value> nestedLiveIns;
+    collectLoopLiveIns(nestedUnorderedLoop, nestedLiveIns);
 
-  // Returns a "unified" view of an mlir::Value. This utility checks if the
-  // value is defined by an op, and if so, return the first value defined by
-  // that op (if there are many), otherwise just returns the value.
-  //
-  // This serves the purpose that if, for example, `%op_res#0` is used in the
-  // outer loop and `%op_res#1` is used in the nested loop (or vice versa), that
-  // we detect both as the same value. If we did not do so, we might falesely
-  // detect that the 2 loops are not perfectly nested since they use "different"
-  // sets of values.
-  auto getUnifiedLiveInView = [](mlir::Value liveIn) {
-    return liveIn.getDefiningOp() != nullptr
-               ? liveIn.getDefiningOp()->getResult(0)
-               : liveIn;
-  };
+    llvm::DenseSet<mlir::Value> outerLiveInsSet;
+    llvm::DenseSet<mlir::Value> nestedLiveInsSet;
 
-  // Re-package both lists of live-ins into sets so that we can use set equality
-  // to compare the values used in the outerloop vs. the nestd one.
+    // Returns a "unified" view of an mlir::Value. This utility checks if the
+    // value is defined by an op, and if so, return the first value defined by
+    // that op (if there are many), otherwise just returns the value.
+    //
+    // This serves the purpose that if, for example, `%op_res#0` is used in the
+    // outer loop and `%op_res#1` is used in the nested loop (or vice versa),
+    // that we detect both as the same value. If we did not do so, we might
+    // falesely detect that the 2 loops are not perfectly nested since they use
+    // "different" sets of values.
+    auto getUnifiedLiveInView = [](mlir::Value liveIn) {
+      return liveIn.getDefiningOp() != nullptr
+                 ? liveIn.getDefiningOp()->getResult(0)
+                 : liveIn;
+    };
 
-  for (auto liveIn : nestedLiveIns)
-    nestedLiveInsSet.insert(getUnifiedLiveInView(liveIn));
+    // Re-package both lists of live-ins into sets so that we can use set
+    // equality to compare the values used in the outerloop vs. the nestd one.
 
-  mlir::Value outerLoopIV;
-  for (auto liveIn : outerLoopLiveIns) {
-    outerLiveInsSet.insert(getUnifiedLiveInView(liveIn));
+    for (auto liveIn : nestedLiveIns)
+      nestedLiveInsSet.insert(getUnifiedLiveInView(liveIn));
 
-    // Keep track of the IV of the outerloop. See `isPerfectlyNested` for more
-    // info on the reason.
-    if (outerLoopIV == nullptr)
-      outerLoopIV = getUnifiedLiveInView(liveIn);
+    mlir::Value outerLoopIV;
+    for (auto liveIn : outerLoopLiveIns) {
+      outerLiveInsSet.insert(getUnifiedLiveInView(liveIn));
+
+      // Keep track of the IV of the outerloop. See `isPerfectlyNested` for more
+      // info on the reason.
+      if (outerLoopIV == nullptr)
+        outerLoopIV = getUnifiedLiveInView(liveIn);
+    }
+
+    // For the 2 loops to be perfectly nested, either:
+    // * both would have exactly the same set of live-in values or,
+    // * the outer loop would have exactly 1 extra live-in value: the outer
+    //   loop's induction variable; this happens when the outer loop's IV is
+    //   *not* referenced in the nested loop.
+    bool isPerfectlyNested = [&]() {
+      if (outerLiveInsSet == nestedLiveInsSet)
+        return true;
+
+      if ((outerLiveInsSet.size() == nestedLiveIns.size() + 1) &&
+          !nestedLiveInsSet.contains(outerLoopIV))
+        return true;
+
+      return false;
+    }();
+
+    if (!isPerfectlyNested)
+      return mlir::failure();
+
+    outerLoop = nestedUnorderedLoop;
+    outerLoopLiveIns = std::move(nestedLiveIns);
   }
 
-  // For the 2 loops to be perfectly nested, either:
-  // * both would have exactly the same set of live-in values or,
-  // * the outer loop would have exactly 1 extra live-in value: the outer
-  //   loop's induction variable; this happens when the outer loop's IV is
-  //   *not* referenced in the nested loop.
-  bool isPerfectlyNested = [&]() {
-    if (outerLiveInsSet == nestedLiveInsSet)
-      return true;
-
-    if ((outerLiveInsSet.size() == nestedLiveIns.size() + 1) &&
-        !nestedLiveInsSet.contains(outerLoopIV))
-      return true;
-
-    return false;
-  }();
-
-  if (!isPerfectlyNested)
-    return mlir::failure();
-
-  return collectLoopNest(nestedUnorderedLoop, nestedLiveIns, loopNest);
+  return mlir::success();
 }
 
 /// Prepares the `fir.do_loop` nest to be easily mapped to OpenMP. In
@@ -512,8 +517,8 @@ public:
     assert(!outermostLoopLives.empty());
 
     looputils::LoopNestToIndVarMap loopNest;
-    bool hasRemainingNestedLoops = failed(
-        looputils::collectLoopNest(doLoop, outermostLoopLives, loopNest));
+    bool hasRemainingNestedLoops =
+        failed(looputils::collectLoopNest(doLoop, loopNest));
 
     looputils::preprocessLoopNest(rewriter, loopNest);
 
