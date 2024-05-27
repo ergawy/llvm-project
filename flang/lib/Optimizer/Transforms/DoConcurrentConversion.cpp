@@ -164,22 +164,15 @@ using LoopNestToIndVarMap =
 /// value corresponding to the induction variable in case the induction variable
 /// is indirectly used in the loop (e.g. throught a cast op).
 bool isIndVarUltimateOperand(mlir::Operation *op, fir::DoLoopOp doLoop) {
-  while (mlir::isa_and_present<fir::StoreOp>(op) ||
-         mlir::isa_and_present<fir::ConvertOp>(op)) {
+  while (op != nullptr && op->getNumOperands() > 0) {
+    auto ivIt = llvm::find_if(op->getOperands(), [&](mlir::Value operand) {
+      return operand == doLoop.getInductionVar();
+    });
 
-    if (auto storeOp = mlir::dyn_cast_if_present<fir::StoreOp>(op)) {
-      if (storeOp.getValue() == doLoop.getInductionVar())
-        return true;
+    if (ivIt != op->getOperands().end())
+      return true;
 
-      op = storeOp.getValue().getDefiningOp();
-    }
-
-    if (auto convertOp = mlir::dyn_cast_if_present<fir::ConvertOp>(op)) {
-      if (convertOp.getOperand() == doLoop.getInductionVar())
-        return true;
-
-      op = convertOp.getValue().getDefiningOp();
-    }
+    op = op->getOperand(0).getDefiningOp();
   }
 
   return false;
