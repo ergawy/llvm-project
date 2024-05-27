@@ -164,14 +164,23 @@ using LoopNestToIndVarMap =
 /// value corresponding to the induction variable in case the induction variable
 /// is indirectly used in the loop (e.g. throught a cast op).
 bool isIndVarUltimateOperand(mlir::Operation *op, fir::DoLoopOp doLoop) {
-  if (auto storeOp = mlir::dyn_cast_if_present<fir::StoreOp>(op))
-    return (storeOp.getValue() == doLoop.getInductionVar()) ||
-           isIndVarUltimateOperand(storeOp.getValue().getDefiningOp(), doLoop);
+  while (mlir::isa_and_present<fir::StoreOp>(op) ||
+         mlir::isa_and_present<fir::ConvertOp>(op)) {
 
-  if (auto convertOp = mlir::dyn_cast_if_present<fir::ConvertOp>(op))
-    return convertOp.getOperand() == doLoop.getInductionVar() ||
-           isIndVarUltimateOperand(convertOp.getValue().getDefiningOp(),
-                                   doLoop);
+    if (auto storeOp = mlir::dyn_cast_if_present<fir::StoreOp>(op)) {
+      if (storeOp.getValue() == doLoop.getInductionVar())
+        return true;
+
+      op = storeOp.getValue().getDefiningOp();
+    }
+
+    if (auto convertOp = mlir::dyn_cast_if_present<fir::ConvertOp>(op)) {
+      if (convertOp.getOperand() == doLoop.getInductionVar())
+        return true;
+
+      op = convertOp.getValue().getDefiningOp();
+    }
+  }
 
   return false;
 };
@@ -252,31 +261,24 @@ extractIndVarUpdateOps(fir::DoLoopOp doLoop) {
 /// and giving `%10` as the starting input: `link`, `defChain` would contain
 /// both of the above ops.
 mlir::LogicalResult
-extractDefChain(mlir::Operation *link,
-                llvm::SmallVectorImpl<mlir::Operation *> &defChain) {
-  if (mlir::isa_and_present<mlir::arith::ConstantOp>(link)) {
-    defChain.push_back(link);
-    // A `ConstantOp` marks the beginning of the chain, so we can stop here.
-    return mlir::success();
+collectIndirectOpChain(mlir::Operation *link,
+                       llvm::SmallVectorImpl<mlir::Operation *> &opChain) {
+  while (!mlir::isa_and_present<mlir::arith::ConstantOp>(link)) {
+    if (auto convertOp = mlir::dyn_cast_if_present<fir::ConvertOp>(link)) {
+      opChain.push_back(link);
+      link = convertOp.getValue().getDefiningOp();
+      continue;
+    }
+
+    std::string opStr;
+    llvm::raw_string_ostream opOs(opStr);
+    opOs << "Unexpected operation: " << *link;
+    return mlir::emitError(link->getLoc(), opOs.str());
   }
 
-  if (auto convertOp = mlir::dyn_cast_if_present<fir::ConvertOp>(link)) {
-    // For a `ConvertOp` we still have links up the chain to walk, so
-    // recursively do so.
-    mlir::LogicalResult result =
-        extractDefChain(convertOp.getValue().getDefiningOp(), defChain);
-
-    if (failed(result))
-      return result;
-
-    defChain.push_back(link);
-    return mlir::success();
-  }
-
-  std::string opStr;
-  llvm::raw_string_ostream opOs(opStr);
-  opOs << "Unexpected operation: " << *link;
-  return mlir::emitError(link->getLoc(), opOs.str());
+  opChain.push_back(link);
+  std::reverse(opChain.begin(), opChain.end());
+  return mlir::success();
 }
 
 /// Starting with `outerLoop` collect a perfectly nested loop nest, if any. This
@@ -777,19 +779,18 @@ private:
     // `fir.convert`op, this lambda clones the `fir.convert` as well as the
     // value it converts from. We do this since `omp.target` regions are
     // isolated from above.
-    std::function<mlir::Operation *(mlir::Operation *)>
-        cloneBoundOrStepDefChain =
-            [&](mlir::Operation *operation) -> mlir::Operation * {
-      llvm::SmallVector<mlir::Operation *> defChain;
+    auto cloneBoundOrStepOpChain =
+        [&](mlir::Operation *operation) -> mlir::Operation * {
+      llvm::SmallVector<mlir::Operation *> opChain;
       mlir::LogicalResult extractResult =
-          looputils::extractDefChain(operation, defChain);
+          looputils::collectIndirectOpChain(operation, opChain);
 
       if (failed(extractResult)) {
         return nullptr;
       }
 
       mlir::Operation *result;
-      for (mlir::Operation *link : defChain)
+      for (mlir::Operation *link : opChain)
         result = rewriter.clone(*link, mapper);
 
       return result;
@@ -798,15 +799,15 @@ private:
     for (auto &[doLoop, _] : loopNest) {
       mlir::Operation *lbOp = doLoop.getLowerBound().getDefiningOp();
       loopNestClauseOps.loopLBVar.push_back(
-          cloneBoundOrStepDefChain(lbOp)->getResult(0));
+          cloneBoundOrStepOpChain(lbOp)->getResult(0));
 
       mlir::Operation *ubOp = doLoop.getUpperBound().getDefiningOp();
       loopNestClauseOps.loopUBVar.push_back(
-          cloneBoundOrStepDefChain(ubOp)->getResult(0));
+          cloneBoundOrStepOpChain(ubOp)->getResult(0));
 
       mlir::Operation *stepOp = doLoop.getStep().getDefiningOp();
       loopNestClauseOps.loopStepVar.push_back(
-          cloneBoundOrStepDefChain(stepOp)->getResult(0));
+          cloneBoundOrStepOpChain(stepOp)->getResult(0));
     }
 
     loopNestClauseOps.loopInclusiveAttr = rewriter.getUnitAttr();
