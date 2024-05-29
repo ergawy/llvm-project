@@ -95,13 +95,17 @@ void AddDebugInfoPass::handleDeclareOp(fir::cg::XDeclareOp declOp,
   // intermediate op and not to BlockArgument. We need to find those cases and
   // walk the chain to get to the actual argument.
 
+  llvm::errs() << ">>>> handleDeclareOp: " << declOp << "\n";
+  llvm::errs() << "     parent op:\n" << *declOp->getParentOp() << "\n";
   unsigned argNo = 0;
+  // Should we take num of arguments of parent block/regions?
   if (auto Arg = llvm::dyn_cast<mlir::BlockArgument>(declOp.getMemref()))
     argNo = Arg.getArgNumber() + 1;
 
   auto tyAttr = typeGen.convertType(fir::unwrapRefType(declOp.getType()),
                                     fileAttr, scopeAttr, declOp.getLoc());
 
+  llvm::errs() << ">>>> DILocalVariableAttr::get argNo: " << argNo << "\n";
   auto localVarAttr = mlir::LLVM::DILocalVariableAttr::get(
       context, scopeAttr, mlir::StringAttr::get(context, result.second.name),
       fileAttr, getLineFromLoc(declOp.getLoc()), argNo, /* alignInBits*/ 0,
