@@ -420,8 +420,13 @@ mlir::LogicalResult collectLoopNest(fir::DoLoopOp outerLoop,
 ///
 /// With this IR change, we can directly inline the innermost loop's region into
 /// the newly generated `omp.loop_nest` op.
-void preprocessLoopNest(mlir::ConversionPatternRewriter &rewriter,
-                        looputils::LoopNestToIndVarMap &loopNest) {
+///
+/// Note that this function has a pre-condition that \p loopNest consists of
+/// perfectly nested loops; i.e. there are no in-between ops between 2 nested
+/// loops except for the ops to setup the inner loop's LB, UB, and step. These
+/// ops are handled/cloned by `genLoopNestClauseOps(..)`.
+void sinkLoopIVArgs(mlir::ConversionPatternRewriter &rewriter,
+                    looputils::LoopNestToIndVarMap &loopNest) {
   if (loopNest.size() <= 1)
     return;
 
@@ -508,7 +513,7 @@ public:
     bool hasRemainingNestedLoops =
         failed(looputils::collectLoopNest(doLoop, loopNest));
 
-    looputils::preprocessLoopNest(rewriter, loopNest);
+    looputils::sinkLoopIVArgs(rewriter, loopNest);
 
     mlir::IRMapping mapper;
     mlir::omp::TargetOp targetOp;
@@ -554,49 +559,21 @@ public:
 
     rewriter.eraseOp(doLoop);
 
-    if (hasRemainingNestedLoops)
-      processNotPerfectlyNestedLoops(rewriter, mapper, ompLoopNest);
+    if (hasRemainingNestedLoops) {
+      // Mark `unordered` loops that are not perfectly nested to be skipped from
+      // the legality check of the `ConversionTarget` since we are not
+      // interested in mapping them to OpenMP.
+      ompLoopNest->walk([&](fir::DoLoopOp doLoop) {
+        if (doLoop.getUnordered()) {
+          concurrentLoopsToSkip.insert(doLoop);
+        }
+      });
+    }
 
     return mlir::success();
   }
 
 private:
-  /// For loops that are not perfectly nested, we need to do 2 things:
-  /// 1. Privatize the memory definition/allocation of their iteration variables
-  ///    since these would cross the boundaries of the target/parallel region
-  ///    after mapping to OpenMP.
-  /// 2. Mark these loops to be skipped from the legality check of the
-  ///    `ConversionTarget` since we are not interested in mapping them to
-  ///    OpenMP.
-  void processNotPerfectlyNestedLoops(mlir::ConversionPatternRewriter &rewriter,
-                                      mlir::IRMapping &mapper,
-                                      mlir::omp::LoopNestOp ompLoopNest) const {
-    ompLoopNest->walk([&](fir::DoLoopOp doLoop) {
-      if (doLoop.getUnordered()) {
-        llvm::SmallVector<mlir::Value> loopLiveIns;
-        looputils::collectLoopLiveIns(doLoop, loopLiveIns);
-
-        looputils::InductionVariableInfo ivInfo{
-            loopLiveIns.front().getDefiningOp(),
-            std::move(looputils::extractIndVarUpdateOps(doLoop))};
-
-        mlir::IRRewriter::InsertPoint ip = rewriter.saveInsertionPoint();
-        rewriter.setInsertionPoint(doLoop);
-
-        mlir::Operation *privatizedIVMemDef =
-            genInductionVariableAlloc(rewriter, ivInfo.iterVarMemDef, mapper);
-        ivInfo.iterVarMemDef->replaceUsesWithIf(
-            privatizedIVMemDef, [&](mlir::OpOperand &operand) {
-              return operand.getOwner()->getParentOp() == doLoop;
-            });
-
-        rewriter.restoreInsertionPoint(ip);
-
-        concurrentLoopsToSkip.insert(doLoop);
-      }
-    });
-  }
-
   void genBoundsOps(mlir::ConversionPatternRewriter &rewriter,
                     mlir::Location loc, hlfir::DeclareOp declareOp,
                     llvm::SmallVectorImpl<mlir::Value> &boundsOps) const {
@@ -693,7 +670,13 @@ private:
          llvm::zip_equal(region.getArguments(), clauseOps.mapVars)) {
       auto miOp = mlir::cast<mlir::omp::MapInfoOp>(mapInfoOp.getDefiningOp());
       hlfir::DeclareOp liveInDeclare = genLiveInDeclare(rewriter, arg, miOp);
-      mapper.map(miOp.getVariableOperand(0), liveInDeclare.getBase());
+      mlir::Value miOperand = miOp.getVariableOperand(0);
+      mapper.map(miOperand, liveInDeclare.getBase());
+
+      if (auto origDeclareOp = mlir::dyn_cast_if_present<hlfir::DeclareOp>(
+              miOperand.getDefiningOp()))
+        mapper.map(origDeclareOp.getOriginalBase(),
+                   liveInDeclare.getOriginalBase());
     }
 
     rewriter.setInsertionPoint(

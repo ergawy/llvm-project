@@ -3,10 +3,10 @@
 
 
 ! RUN: %flang_fc1 -emit-hlfir -fopenmp -fdo-concurrent-parallel=host %s -o - \
-! RUN:   | FileCheck %s --check-prefix=HOST
+! RUN:   | FileCheck %s --check-prefixes=HOST,COMMON
 
 ! RUN: %flang_fc1 -emit-hlfir -fopenmp -fdo-concurrent-parallel=device %s -o - \
-! RUN:   | FileCheck %s --check-prefixes=DEVICE,HOST
+! RUN:   | FileCheck %s --check-prefixes=DEVICE,COMMON
 
 program main
    integer, parameter :: n = 10
@@ -23,29 +23,41 @@ program main
    end do
 end
 
+! HOST: %[[ORIG_K_ALLOC:.*]] = fir.alloca i32 {bindc_name = "k"}
+! HOST: %[[ORIG_K_DECL:.*]]:2 = hlfir.declare %[[ORIG_K_ALLOC]]
+
+! HOST: %[[ORIG_J_ALLOC:.*]] = fir.alloca i32 {bindc_name = "j"}
+! HOST: %[[ORIG_J_DECL:.*]]:2 = hlfir.declare %[[ORIG_J_ALLOC]]
+
 ! DEVICE: omp.target
+
+! DEVICE:   ^bb0(%[[I_ARG:[^[:space:]]+]]: !fir.ref<i32>, %[[X_ARG:[^[:space:]]+]]: !fir.ref<i32>,
+! DEVICE-SAME:   %[[J_ARG:[^[:space:]]+]]: !fir.ref<i32>, %[[K_ARG:[^[:space:]]+]]: !fir.ref<i32>,
+! DEVICE-SAME:   %[[A_ARG:[^[:space:]]+]]: !fir.ref<!fir.array<10x20x30xi32>>):
+
+! DEVICE: %[[TARGET_J_DECL:.*]]:2 = hlfir.declare %[[J_ARG]] {uniq_name = "_QFEj"}
+! DEVICE: %[[TARGET_K_DECL:.*]]:2 = hlfir.declare %[[K_ARG]] {uniq_name = "_QFEk"}
+
 ! DEVICE: omp.teams
 ! DEVICE: omp.distribute
 
-! HOST: omp.parallel {
-! HOST: omp.wsloop {
-! HOST: omp.loop_nest ({{[^[:space:]]+}}) {{.*}} {
-! HOST:   %[[PRIV_J_ALLOC:.*]] = fir.alloca i32 {bindc_name = "j"}
-! HOST:   %[[PRIV_J_DECL:.*]]:2 = hlfir.declare %[[PRIV_J_ALLOC]]
-! HOST:   fir.do_loop %[[J_IV:.*]] = {{.*}} {
-! HOST:     %[[J_IV_CONV:.*]] = fir.convert %[[J_IV]] : (index) -> i32
-! HOST:     fir.store %[[J_IV_CONV]] to %[[PRIV_J_DECL]]#1 : !fir.ref<i32>
+! COMMON: omp.parallel {
+! COMMON: omp.wsloop {
+! COMMON: omp.loop_nest ({{[^[:space:]]+}}) {{.*}} {
+! COMMON:   fir.do_loop %[[J_IV:.*]] = {{.*}} {
+! COMMON:     %[[J_IV_CONV:.*]] = fir.convert %[[J_IV]] : (index) -> i32
+! HOST:       fir.store %[[J_IV_CONV]] to %[[ORIG_J_DECL]]#1
+! DEVICE:     fir.store %[[J_IV_CONV]] to %[[TARGET_J_DECL]]#1
 
-! HOST:     %[[PRIV_K_ALLOC:.*]] = fir.alloca i32 {bindc_name = "k"}
-! HOST:     %[[PRIV_K_DECL:.*]]:2 = hlfir.declare %[[PRIV_K_ALLOC]]
-! HOST:     fir.do_loop %[[K_IV:.*]] = {{.*}} {
-! HOST:       %[[K_IV_CONV:.*]] = fir.convert %[[K_IV]] : (index) -> i32
-! HOST:       fir.store %[[K_IV_CONV]] to %[[PRIV_K_DECL]]#1 : !fir.ref<i32>
-! HOST:     }
-! HOST:   }
-! HOST: omp.yield
-! HOST: }
-! HOST: omp.terminator
-! HOST: }
-! HOST: omp.terminator
-! HOST: }
+! COMMON:     fir.do_loop %[[K_IV:.*]] = {{.*}} {
+! COMMON:       %[[K_IV_CONV:.*]] = fir.convert %[[K_IV]] : (index) -> i32
+! HOST:         fir.store %[[K_IV_CONV]] to %[[ORIG_K_DECL]]#1
+! DEVICE:       fir.store %[[K_IV_CONV]] to %[[TARGET_K_DECL]]#1
+! COMMON:     }
+! COMMON:   }
+! COMMON: omp.yield
+! COMMON: }
+! COMMON: omp.terminator
+! COMMON: }
+! COMMON: omp.terminator
+! COMMON: }
