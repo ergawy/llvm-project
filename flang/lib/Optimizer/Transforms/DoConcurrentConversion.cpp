@@ -280,6 +280,7 @@ collectIndirectOpChain(mlir::Operation *link,
 /// parent loops it discovered before.
 mlir::LogicalResult collectLoopNest(fir::DoLoopOp outerLoop,
                                     LoopNestToIndVarMap &loopNest) {
+  assert(outerLoop.getUnordered());
   llvm::SmallVector<mlir::Value> outerLoopLiveIns;
   collectLoopLiveIns(outerLoop, outerLoopLiveIns);
 
