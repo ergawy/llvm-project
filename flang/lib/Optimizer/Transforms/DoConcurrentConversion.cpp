@@ -910,8 +910,9 @@ public:
     }
     llvm::DenseSet<fir::DoLoopOp> concurrentLoopsToSkip;
     mlir::RewritePatternSet patterns(context);
+    patterns.insert<DoConcurrentConversion>(
         context, mapTo == fir::omp::DoConcurrentMappingKind::DCMK_Device,
-                                            concurrentLoopsToSkip);
+        concurrentLoopsToSkip);
     mlir::ConversionTarget target(*context);
     target.addLegalDialect<fir::FIROpsDialect, hlfir::hlfirDialect,
                            mlir::arith::ArithDialect, mlir::func::FuncDialect,
