@@ -14,31 +14,45 @@ local:
 ---
 ```
 
-This document seeks to describe the effort to parallelize `do concurrent` loops by mapping them to OpenMP worksharing constructs. The goals of this document are:
-* Describe how to instruct `flang-new` to map `DO CONCURENT` loops to OpenMP constructs.
-* Track the current status of such mapping.
-* Describe the limitations of the current implmenentation.
-* Describe next steps.
+This document seeks to describe the effort to parallelize `do concurrent` loops
+by mapping them to OpenMP worksharing constructs. The goals of this document
+are:
+* Describing how to instruct `flang-new` to map `DO CONCURENT` loops to OpenMP
+  constructs.
+* Tracking the current status of such mapping.
+* Describing the limitations of the current implmenentation.
+* Describing next steps.
 
 ## Usage
 
-In order to enable `do concurrent` to OpenMP mapping, `flang-new` adds a new compiler flag: `-fdo-concurrent-parallel`. This flags has 3 possible values:
-1. `host`: this maps `do concurent` loops to run in parallel on the host CPU. This maps such loops to the equivalent of `omp parallel do`.
-2. `device`: this maps `do concurent` loops to run in parallel on a device (GPU). This maps such loops to the equivalent of `omp target teams distribute parallel do`.
-3. `none`: this disables `do concurrent` mapping altogether. In such case, such loops are emitted as sequential loops.
+In order to enable `do concurrent` to OpenMP mapping, `flang-new` adds a new
+compiler flag: `-fdo-concurrent-parallel`. This flags has 3 possible values:
+1. `host`: this maps `do concurent` loops to run in parallel on the host CPU.
+   This maps such loops to the equivalent of `omp parallel do`.
+2. `device`: this maps `do concurent` loops to run in parallel on a device
+   (GPU). This maps such loops to the equivalent of `omp target teams
+   distribute parallel do`.
+3. `none`: this disables `do concurrent` mapping altogether. In such case, such
+   loops are emitted as sequential loops.
 
-The above compiler switch is currently avaialble only when OpenMP is also enable. So you need to privde the following to flang in order to enable it:
+The above compiler switch is currently avaialble only when OpenMP is also
+enabled. So you need to provide the following options to flang in order to
+enable it:
 ```
 flang-new ... -fopenmp -fdo-concurrent-parallel=[host|device|none] ...
 ```
 
 ## Current status
 
-Under the hood, `do concurrent` mapping is implemented in the `DoConcurrentConversionPass`. This is still an experimental pass which means that:
+Under the hood, `do concurrent` mapping is implemented in the
+`DoConcurrentConversionPass`. This is still an experimental pass which means
+that:
 * It has been tested in a very limited way so far.
 * It has been tested on simple synthetic inputs.
 
-To describe current status in more detail, following is a description of how the pass currently behaves for single-range loops and then for multi-range loops.
+To describe current status in more detail, following is a description of how
+the pass currently behaves for single-range loops and then for multi-range
+loops.
 
 ### Single-range loops
 
@@ -51,7 +65,8 @@ Given the following loop:
 
 #### Mapping to `host`
 
-Mapping this loop to the `host`, generates MLIR operations of the following structure:
+Mapping this loop to the `host`, generates MLIR operations of the following
+structure:
 
 ```mlir
 %4 = fir.address_of(@_QFEa) ...
@@ -83,7 +98,8 @@ omp.parallel {
 
 #### Mapping to `device`
 
-Mapping the same loop to the `device`, generates MLIR operations of the following structure:
+Mapping the same loop to the `device`, generates MLIR operations of the
+following structure:
 
 ```mlir
 // Map `a` to the `target` region.
@@ -124,7 +140,8 @@ omp.target ... map_entries(..., %29 -> %arg4 ...) {
 
 ### Multi-range loops
 
-The pass currently supports multi-range loops as well. Given the following example:
+The pass currently supports multi-range loops as well. Given the following
+example:
 
 ```fortran
    do concurrent(i=1:n, j=1:m)
@@ -145,11 +162,15 @@ omp.loop_nest (%arg0, %arg1)
 }
 ```
 
-It is worth noting that we have privatized versions for both iteration variables: `i` and `j`. These are locally allocated inside the parallel/target OpenMP region similar to what the single-range example in previous section shows.
+It is worth noting that we have privatized versions for both iteration
+variables: `i` and `j`. These are locally allocated inside the parallel/target
+OpenMP region similar to what the single-range example in previous section
+shows.
 
 #### Multi-range and perfectly-nested loops
 
-Currently, on the `FIR` dialect level, the following 2 loops are modelled in exactly the same way:
+Currently, on the `FIR` dialect level, the following 2 loops are modelled in
+exactly the same way:
 
 ```fortran
 do concurrent(i=1:n, j=1:m)
@@ -165,7 +186,7 @@ do concurrent(i=1:n)
 end do
 ```
 
-Both of the above loops are modeleld as:
+Both of the above loops are modelled as:
 
 ```mlir
 fir.do_loop %arg0 = %11 to %12 step %c1 unordered {
@@ -176,11 +197,16 @@ fir.do_loop %arg0 = %11 to %12 step %c1 unordered {
 }
 ```
 
-Consequently, from the `DoConcurrentConversionPass`' perspective, both loops are treated in the same manner. Under the hood, the pass detects perfectly-nested loop nests and maps such nests as if they were multi-range loops.
+Consequently, from the `DoConcurrentConversionPass`' perspective, both loops
+are treated in the same manner. Under the hood, the pass detects
+perfectly-nested loop nests and maps such nests as if they were multi-range
+loops.
 
 #### Non-perfectly-nested loops
 
-One limitation that the pass currently have is that it treats any intervening code in a loop nest as being disruptive to detecting that nest as a single unit. For example, given the following input:
+One limitation that the pass currently have is that it treats any intervening
+code in a loop nest as being disruptive to detecting that nest as a single
+unit. For example, given the following input:
 
 ```fortran
 do concurrent(i=1:n)
@@ -191,17 +217,33 @@ do concurrent(i=1:n)
 end do
 ```
 
-Since there at least one statement between the 2 loop header (i.e. `x = 41`), the pass does not detect the `i` and `j` loops as a nest. Rather, the pass in that case only maps the `i` loop to OpenMP and leaves the `j` loop in its origianl form. In theory, in this example, we can sink the intervening code into the `j` loop and detect the complete nest. However, such transformation is still to be implemented in the future.
+Since there at least one statement between the 2 loop header (i.e. `x = 41`),
+the pass does not detect the `i` and `j` loops as a nest. Rather, the pass in
+that case only maps the `i` loop to OpenMP and leaves the `j` loop in its
+origianl form. In theory, in this example, we can sink the intervening code
+into the `j` loop and detect the complete nest. However, such transformation is
+still to be implemented in the future.
 
-The above also has the consequence that the `j` variable will **not** privatized in the OpenMP parallel/target region. In other words, it will be treated as if it was a `shared` variable. For more details about privatization, see the data environment section below.
+The above also has the consequence that the `j` variable will **not** be
+privatized in the OpenMP parallel/target region. In other words, it will be
+treated as if it was a `shared` variable. For more details about privatization,
+see the "Data environment" section below.
 
 ### Data environment
 
-By default, variables that are used inside a `do concurernt` loop nest are either treated as `shared` in case of mapping to `host`, or mapped into the `target` region using a `map` clause in case of mapping to `device`. The only exception to this is the loop's iteration variable(s) of **perfect** loop nest. In that case, for each IV, we allocate a local copy as shown the by the mapping examples above.
+By default, variables that are used inside a `do concurernt` loop nest are
+either treated as `shared` in case of mapping to `host`, or mapped into the
+`target` region using a `map` clause in case of mapping to `device`. The only
+exception to this is the loop's iteration variable(s) (IV) of **perfect** loop
+nest. In that case, for each IV, we allocate a local copy as shown the by the
+mapping examples above.
 
 #### Non-perfectly-nested loops' IVs
 
-For non-perfectly-nested loops, the IV(s) are still treated as `shared` or `map` entries as pointed out above. This **might not** be consistent with what the Fortran specficiation tells us. In particular, taking the following snippets from the spec (version 2023) into account:
+For non-perfectly-nested loops, the IVs are still treated as `shared` or
+`map` entries as pointed out above. This **might not** be consistent with what
+the Fortran specficiation tells us. In particular, taking the following
+snippets from the spec (version 2023) into account:
 
 > § 3.35
 > ------
@@ -210,31 +252,60 @@ For non-perfectly-nested loops, the IV(s) are still treated as `shared` or `map`
 
 > § 19.4
 > ------
->  A variable that appears as an index-name in a FORALL or DO CONCURRENT construct, or ... is a construct entity. A variable that has LOCAL or LOCAL_INIT locality in a DO CONCURRENT construct is a construct entity.
+>  A variable that appears as an index-name in a FORALL or DO CONCURRENT
+>  construct, or ... is a construct entity. A variable that has LOCAL or
+>  LOCAL_INIT locality in a DO CONCURRENT construct is a construct entity.
 > ...
-> The name of a variable that appears as an index-name in a DO CONCURRENT construct, FORALL statement, or FORALL construct has a scope of the statement or construct. A variable that has LOCAL or LOCAL_INIT locality in a DO CONCURRENT construct has the scope of that construct.
+> The name of a variable that appears as an index-name in a DO CONCURRENT
+> construct, FORALL statement, or FORALL construct has a scope of the statement
+> or construct. A variable that has LOCAL or LOCAL_INIT locality in a DO
+> CONCURRENT construct has the scope of that construct.
 
-From the above quotes, it seems there is an equivalence between the IV of a `do concurrent` loop and a variable with a `LOCAL` locality specifier (equivalent to OpenMP's `private` clause). Which means that we should probably localize/privatize a `do concurernt` loop's IV even if it is not perfectly nested in the nest we are parallelizing. For now, however, we **do not** that as pointed out previously. In the near future, we propose a middle-ground solution (see the Next steps section for more details).
+From the above quotes, it seems there is an equivalence between the IV of a `do
+concurrent` loop and a variable with a `LOCAL` locality specifier (equivalent
+to OpenMP's `private` clause). Which means that we should probably
+localize/privatize a `do concurernt` loop's IV even if it is not perfectly
+nested in the nest we are parallelizing. For now, however, we **do not** do
+that as pointed out previously. In the near future, we propose a middle-ground
+solution (see the Next steps section for more details).
 
 ## Next steps
 
 ### Delayed privatization
 
-So far, we emit the privatization logic for IVs inline in the paralle/target region. This is enough for out purposes right now since we don't localize/privatize any sophisticated types of variables yet. Once we have need for more advanced localization thought `do concurrent`'s locality specified (see below), delayed privatization will enable us to have a much cleaner IR. Once delayed privatization's implementation upstream is supported for the required constructs by the pass, we will move to it rather than inlined/early privatization.
+So far, we emit the privatization logic for IVs inline in the parallel/target
+region. This is enough for our purposes right now since we don't
+localize/privatize any sophisticated types of variables yet. Once we have need
+for more advanced localization through `do concurrent`'s locality specifiers
+(see below), delayed privatization will enable us to have a much cleaner IR.
+Once delayed privatization's implementation upstream is supported for the
+required constructs by the pass, we will move to it rather than inlined/early
+privatization.
 
 ### Locality specifiers for `do concurrent`
 
-Locality specified will enable the user to control the data environment of the loop nest in a more fine-grained way. Implementing these specified on the `FIR` dialect level is needed in order to support this in the `DoConcurrentConversionPass`.
+Locality specifiers will enable the user to control the data environment of the
+loop nest in a more fine-grained way. Implementing these specifiers on the
+`FIR` dialect level is needed in order to support this in the
+`DoConcurrentConversionPass`.
 
-Such specified will also unlock a potential solution to the non-perfectly-nested loops' IVs issue described above. In particular, for a non-perfectly nested loop, one middle-ground proposal/solution would be to:
+Such specified will also unlock a potential solution to the
+non-perfectly-nested loops' IVs issue described above. In particular, for a
+non-perfectly nested loop, one middle-ground proposal/solution would be to:
 * Emit the loop's IV as shared/mapped just like we do currently.
 * Emit a warning that the IV of the loop is emitted as shared/mapped.
-* Given support for `LOCAL`, we can recommend the user to explicitly localize/privatize the loop's  IV if they choose to.
+* Given support for `LOCAL`, we can recommend the user to explicitly
+  localize/privatize the loop's IV if they choose to.
 
 ### More advanced detection of loop nests
 
-As pointed out earlier, any intervening code between the headers of 2 nested `do concurrent` loops prevents us currently from detecting this as a loop nest. In some cases this is overly conservative. Therefore, a more flexible detection logic of loop nests needs to be implemented.
+As pointed out earlier, any intervening code between the headers of 2 nested
+`do concurrent` loops prevents us currently from detecting this as a loop nest.
+In some cases this is overly conservative. Therefore, a more flexible detection
+logic of loop nests needs to be implemented.
 
 ### Data-dependence analysis
 
-Right now, we map loop nests without analysing whether such mapping is safe to do or not. We probalby need to at least warn the use of unsafe loop nests due to loop-carried dependencies.
+Right now, we map loop nests without analysing whether such mapping is safe to
+do or not. We probalby need to at least warn the use of unsafe loop nests due
+to loop-carried dependencies.
