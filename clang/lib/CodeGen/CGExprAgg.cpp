@@ -448,11 +448,7 @@ AggExprEmitter::VisitCXXStdInitializerListExpr(CXXStdInitializerListExpr *E) {
   AggValueSlot Dest = EnsureSlot(E->getType());
   LValue DestLV = CGF.MakeAddrLValue(Dest.getAddress(), E->getType());
   LValue Start = CGF.EmitLValueForFieldInitialization(DestLV, *Field);
-  llvm::Value *Zero = llvm::ConstantInt::get(CGF.PtrDiffTy, 0);
-  llvm::Value *IdxStart[] = { Zero, Zero };
-  llvm::Value *ArrayStart = Builder.CreateInBoundsGEP(
-      ArrayPtr.getElementType(), ArrayPtr.emitRawPointer(CGF), IdxStart,
-      "arraystart");
+  llvm::Value *ArrayStart = ArrayPtr.emitRawPointer(CGF);
   CGF.EmitStoreThroughLValue(RValue::get(ArrayStart), Start);
   ++Field;
 
@@ -467,6 +463,7 @@ AggExprEmitter::VisitCXXStdInitializerListExpr(CXXStdInitializerListExpr *E) {
       Ctx.hasSameType(Field->getType()->getPointeeType(),
                       ArrayType->getElementType())) {
     // End pointer.
+    llvm::Value *Zero = llvm::ConstantInt::get(CGF.PtrDiffTy, 0);
     llvm::Value *IdxEnd[] = { Zero, Size };
     llvm::Value *ArrayEnd = Builder.CreateInBoundsGEP(
         ArrayPtr.getElementType(), ArrayPtr.emitRawPointer(CGF), IdxEnd,
@@ -512,19 +509,20 @@ void AggExprEmitter::EmitArrayInit(Address DestPtr, llvm::ArrayType *AType,
   uint64_t NumInitElements = Args.size();
 
   uint64_t NumArrayElements = AType->getNumElements();
+  for (const auto *Init : Args) {
+    if (const auto *Embed = dyn_cast<EmbedExpr>(Init->IgnoreParenImpCasts())) {
+      NumInitElements += Embed->getDataElementCount() - 1;
+      if (NumInitElements > NumArrayElements) {
+        NumInitElements = NumArrayElements;
+        break;
+      }
+    }
+  }
+
   assert(NumInitElements <= NumArrayElements);
 
   QualType elementType =
       CGF.getContext().getAsArrayType(ArrayQTy)->getElementType();
-
-  // DestPtr is an array*.  Construct an elementType* by drilling
-  // down a level.
-  llvm::Value *zero = llvm::ConstantInt::get(CGF.SizeTy, 0);
-  llvm::Value *indices[] = { zero, zero };
-  llvm::Value *begin = Builder.CreateInBoundsGEP(DestPtr.getElementType(),
-                                                 DestPtr.emitRawPointer(CGF),
-                                                 indices, "arrayinit.begin");
-
   CharUnits elementSize = CGF.getContext().getTypeSizeInChars(elementType);
   CharUnits elementAlign =
     DestPtr.getAlignment().alignmentOfArrayElement(elementSize);
@@ -565,6 +563,7 @@ void AggExprEmitter::EmitArrayInit(Address DestPtr, llvm::ArrayType *AType,
   Address endOfInit = Address::invalid();
   CodeGenFunction::CleanupDeactivationScope deactivation(CGF);
 
+  llvm::Value *begin = DestPtr.emitRawPointer(CGF);
   if (dtorKind) {
     CodeGenFunction::AllocaTrackerRAII allocaTracker(CGF);
     // In principle we could tell the cleanup where we are more
@@ -588,29 +587,37 @@ void AggExprEmitter::EmitArrayInit(Address DestPtr, llvm::ArrayType *AType,
 
   llvm::Value *one = llvm::ConstantInt::get(CGF.SizeTy, 1);
 
-  // The 'current element to initialize'.  The invariants on this
-  // variable are complicated.  Essentially, after each iteration of
-  // the loop, it points to the last initialized element, except
-  // that it points to the beginning of the array before any
-  // elements have been initialized.
-  llvm::Value *element = begin;
-
-  // Emit the explicit initializers.
-  for (uint64_t i = 0; i != NumInitElements; ++i) {
-    // Advance to the next element.
-    if (i > 0) {
+  auto Emit = [&](Expr *Init, uint64_t ArrayIndex) {
+    llvm::Value *element = begin;
+    if (ArrayIndex > 0) {
       element = Builder.CreateInBoundsGEP(
-          llvmElementType, element, one, "arrayinit.element");
+          llvmElementType, begin,
+          llvm::ConstantInt::get(CGF.SizeTy, ArrayIndex), "arrayinit.element");
 
       // Tell the cleanup that it needs to destroy up to this
       // element.  TODO: some of these stores can be trivially
       // observed to be unnecessary.
-      if (endOfInit.isValid()) Builder.CreateStore(element, endOfInit);
+      if (endOfInit.isValid())
+        Builder.CreateStore(element, endOfInit);
     }
 
     LValue elementLV = CGF.MakeAddrLValue(
         Address(element, llvmElementType, elementAlign), elementType);
-    EmitInitializationToLValue(Args[i], elementLV);
+    EmitInitializationToLValue(Init, elementLV);
+    return true;
+  };
+
+  unsigned ArrayIndex = 0;
+  // Emit the explicit initializers.
+  for (uint64_t i = 0; i != NumInitElements; ++i) {
+    if (ArrayIndex >= NumInitElements)
+      break;
+    if (auto *EmbedS = dyn_cast<EmbedExpr>(Args[i]->IgnoreParenImpCasts())) {
+      EmbedS->doForEachDataElement(Emit, ArrayIndex);
+    } else {
+      Emit(Args[i], ArrayIndex);
+      ArrayIndex++;
+    }
   }
 
   // Check whether there's a non-trivial array-fill expression.
@@ -627,9 +634,12 @@ void AggExprEmitter::EmitArrayInit(Address DestPtr, llvm::ArrayType *AType,
     //   do { *array++ = filler; } while (array != end);
 
     // Advance to the start of the rest of the array.
+    llvm::Value *element = begin;
     if (NumInitElements) {
       element = Builder.CreateInBoundsGEP(
-          llvmElementType, element, one, "arrayinit.start");
+          llvmElementType, element,
+          llvm::ConstantInt::get(CGF.SizeTy, NumInitElements),
+          "arrayinit.start");
       if (endOfInit.isValid()) Builder.CreateStore(element, endOfInit);
     }
 
@@ -1789,7 +1799,6 @@ void AggExprEmitter::VisitCXXParenListOrInitListExpr(
     // Push a destructor if necessary.
     // FIXME: if we have an array of structures, all explicitly
     // initialized, we can end up pushing a linear number of cleanups.
-    bool pushedCleanup = false;
     if (QualType::DestructionKind dtorKind
           = field->getType().isDestructedType()) {
       assert(LV.isSimple());
@@ -1797,17 +1806,8 @@ void AggExprEmitter::VisitCXXParenListOrInitListExpr(
         CGF.pushDestroyAndDeferDeactivation(NormalAndEHCleanup, LV.getAddress(),
                                             field->getType(),
                                             CGF.getDestroyer(dtorKind), false);
-        pushedCleanup = true;
       }
     }
-
-    // If the GEP didn't get used because of a dead zero init or something
-    // else, clean it up for -O0 builds and general tidiness.
-    if (!pushedCleanup && LV.isSimple())
-      if (llvm::GetElementPtrInst *GEP =
-              dyn_cast<llvm::GetElementPtrInst>(LV.emitRawPointer(CGF)))
-        if (GEP->use_empty())
-          GEP->eraseFromParent();
   }
 }
 

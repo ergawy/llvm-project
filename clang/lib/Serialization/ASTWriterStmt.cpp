@@ -1262,6 +1262,17 @@ void ASTStmtWriter::VisitSourceLocExpr(SourceLocExpr *E) {
   Code = serialization::EXPR_SOURCE_LOC;
 }
 
+void ASTStmtWriter::VisitEmbedExpr(EmbedExpr *E) {
+  VisitExpr(E);
+  Record.AddSourceLocation(E->getBeginLoc());
+  Record.AddSourceLocation(E->getEndLoc());
+  Record.AddStmt(E->getFilenameStringLiteral());
+  Record.AddStmt(E->getDataStringLiteral());
+  Record.writeUInt32(E->getStartingElementPos());
+  Record.writeUInt32(E->getDataElementCount());
+  Code = serialization::EXPR_BUILTIN_PP_EMBED;
+}
+
 void ASTStmtWriter::VisitAddrLabelExpr(AddrLabelExpr *E) {
   VisitExpr(E);
   Record.AddSourceLocation(E->getAmpAmpLoc());
@@ -2847,6 +2858,7 @@ void ASTStmtWriter::VisitOpenACCConstructStmt(OpenACCConstructStmt *S) {
   Record.push_back(S->clauses().size());
   Record.writeEnum(S->Kind);
   Record.AddSourceRange(S->Range);
+  Record.AddSourceLocation(S->DirectiveLoc);
   Record.writeOpenACCClauseList(S->clauses());
 }
 
@@ -2860,6 +2872,12 @@ void ASTStmtWriter::VisitOpenACCComputeConstruct(OpenACCComputeConstruct *S) {
   VisitStmt(S);
   VisitOpenACCAssociatedStmtConstruct(S);
   Code = serialization::STMT_OPENACC_COMPUTE_CONSTRUCT;
+}
+
+void ASTStmtWriter::VisitOpenACCLoopConstruct(OpenACCLoopConstruct *S) {
+  VisitStmt(S);
+  VisitOpenACCAssociatedStmtConstruct(S);
+  Code = serialization::STMT_OPENACC_LOOP_CONSTRUCT;
 }
 
 //===----------------------------------------------------------------------===//
