@@ -131,26 +131,36 @@ private:
     if (!targetOp)
       return;
 
-    mlir::Block *targetParentBlock = targetOp->getBlock();
-    assert(targetParentBlock != nullptr &&
-           "Expected omp.target op to be nested in a parent op.");
+    mlir::Region *targetParentRegion = targetOp->getParentRegion();
+    assert(targetParentRegion != nullptr &&
+           "Expected omp.target op to be nested in a parent region.");
 
-    for (mlir::Operation &op : targetParentBlock->getOperations()) {
-      for (mlir::OpOperand &operand : op.getOpOperands()) {
-        mlir::Operation *operandDefiningOp = operand.get().getDefiningOp();
+    // Walk the parent region in pre-order to make sure we visit `targetOp`
+    // before its nested ops.
+    targetParentRegion->walk<mlir::WalkOrder::PreOrder>(
+        [&](mlir::Operation *op) {
+          // Once we come across `targetOp`, we interrupt the walk since we
+          // already visited all the ops that come before it in the region.
+          if (op == targetOp)
+            return mlir::WalkResult::interrupt();
 
-        if (operandDefiningOp == nullptr)
-          continue;
+          for (mlir::OpOperand &operand : op->getOpOperands()) {
+            mlir::Operation *operandDefiningOp = operand.get().getDefiningOp();
 
-        auto parentTargetOp =
-            operandDefiningOp->getParentOfType<mlir::omp::TargetOp>();
+            if (operandDefiningOp == nullptr)
+              continue;
 
-        if (parentTargetOp != targetOp)
-          continue;
+            auto parentTargetOp =
+                operandDefiningOp->getParentOfType<mlir::omp::TargetOp>();
 
-        escapingOperands.insert(&operand);
-      }
-    }
+            if (parentTargetOp != targetOp)
+              continue;
+
+            escapingOperands.insert(&operand);
+          }
+
+          return mlir::WalkResult::advance();
+        });
   }
 
   // For an escaping operand, clone its use-def chain (i.e. its backward slice)
