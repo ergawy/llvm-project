@@ -135,7 +135,7 @@ private:
     assert(targetParentBlock != nullptr &&
            "Expected omp.target op to be nested in a parent op.");
 
-    for (mlir::Operation &op : targetParentBlock->getOperations())
+    for (mlir::Operation &op : targetParentBlock->getOperations()) {
       for (mlir::OpOperand &operand : op.getOpOperands()) {
         mlir::Operation *operandDefiningOp = operand.get().getDefiningOp();
 
@@ -150,6 +150,7 @@ private:
 
         escapingOperands.insert(&operand);
       }
+    }
   }
 
   // For an escaping operand, clone its use-def chain (i.e. its backward slice)
@@ -186,16 +187,20 @@ private:
 
     for (mlir::OpOperand *operand : escapingOperands) {
       mlir::Operation *operandDefiningOp = operand->get().getDefiningOp();
+      assert(operandDefiningOp != nullptr &&
+             "Expected escaping operand to have a defining op (i.e. not to be "
+             "a block argument)");
       mlir::Operation *lastSliceOp = cloneOperandSliceOutsideTargetOp(operand);
 
       // Find the index of the operand in the list of results produced by its
       // defining op.
       unsigned operandResultIdx = 0;
-      for (auto [idx, res] : llvm::enumerate(operandDefiningOp->getResults()))
+      for (auto [idx, res] : llvm::enumerate(operandDefiningOp->getResults())) {
         if (res == operand->get()) {
           operandResultIdx = idx;
           break;
         }
+      }
 
       // Replace the escaping operand with the corresponding value from the
       // op that we cloned outside the target op.
