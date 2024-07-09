@@ -15,7 +15,10 @@
 #include "flang/Optimizer/HLFIR/HLFIRDialect.h"
 #include "flang/Optimizer/HLFIR/HLFIROps.h"
 #include "flang/Optimizer/Transforms/Passes.h"
+#include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/IRMapping.h"
@@ -468,6 +471,77 @@ void sinkLoopIVArgs(mlir::ConversionPatternRewriter &rewriter,
     ++idx;
   }
 }
+
+/// Collects values are that are destroyed by the Fortran runtime within the
+/// loop's scope.
+///
+/// \param [in] doLoop - the loop within which the function searches for locally
+/// destroyed values.
+///
+/// \param [out] local - a map from locally destroyed values to the runtime
+/// destroy opertaions that destroy them.
+void collectLocallyDestroyedValuesInLoop(
+    fir::DoLoopOp doLoop,
+    llvm::DenseMap<mlir::Value, mlir::Operation *> &locals) {
+  constexpr static auto destroy{"_FortranADestroy"};
+  doLoop.getRegion().walk([&](fir::CallOp call) {
+    auto callee = call.getCallee();
+
+    if (!callee.has_value())
+      return;
+
+    if (callee.value().getLeafReference().str() != destroy)
+      return;
+
+    assert(call.getNumOperands() == 1);
+
+    mlir::BackwardSliceOptions options;
+    options.inclusive = true;
+    llvm::SetVector<mlir::Operation *> opSlice;
+    mlir::getBackwardSlice(call, &opSlice, options);
+
+    if (auto alloca = mlir::dyn_cast_if_present<fir::AllocaOp>(opSlice.front()))
+      locals.try_emplace(alloca.getResult(), call);
+  });
+}
+
+/// For a locally destroyed value \p local within a loop's scope, localizes that
+/// value within the scope of the parallel region the loop maps to. Towards that
+/// end, this function allocates a private copy of \p local within \p
+/// allocRegion.
+///
+/// \param local - the locally destroyed value within a loop's scope (see
+/// collectLocallyDestroyedValuesInLoop).
+///
+/// \param localDestroyer - the Fortran runtime call operation that destroys \p
+/// local.
+///
+/// \param allocRegion - the parallel region where \p local's allocation will be
+/// cloned (i.e. privatized).
+///
+/// \param rewriter - builder used for updating \p allocRegion.
+///
+/// \param mapper - mapper to track updated references \p local within \p
+/// allocRegion.
+void localizeLocallyDestroyedValue(mlir::Value local,
+                                   mlir::Operation *localDestroyer,
+                                   mlir::Region &allocRegion,
+                                   mlir::ConversionPatternRewriter &rewriter,
+                                   mlir::IRMapping &mapper) {
+  mlir::Region *loopRegion = localDestroyer->getParentRegion();
+  assert(loopRegion != nullptr);
+
+  mlir::IRRewriter::InsertPoint ip = rewriter.saveInsertionPoint();
+  rewriter.setInsertionPointToStart(&allocRegion.front());
+  mlir::Operation *newLocalDef = rewriter.clone(*local.getDefiningOp(), mapper);
+  rewriter.replaceUsesWithIf(
+      local, newLocalDef->getResult(0), [&](mlir::OpOperand &operand) {
+        return operand.getOwner()->getParentRegion() == loopRegion;
+      });
+  mapper.map(local, newLocalDef->getResult(0));
+
+  rewriter.restoreInsertionPoint(ip);
+}
 } // namespace looputils
 
 class DoConcurrentConversion : public mlir::OpConversionPattern<fir::DoLoopOp> {
@@ -519,9 +593,14 @@ public:
     bool hasRemainingNestedLoops =
         failed(looputils::collectLoopNest(doLoop, loopNest));
 
+    mlir::IRMapping mapper;
+
+    llvm::DenseMap<mlir::Value, mlir::Operation *> locals;
+    looputils::collectLocallyDestroyedValuesInLoop(loopNest.back().first,
+                                                   locals);
+
     looputils::sinkLoopIVArgs(rewriter, loopNest);
 
-    mlir::IRMapping mapper;
     mlir::omp::TargetOp targetOp;
     mlir::omp::LoopNestClauseOps loopNestClauseOps;
 
@@ -541,8 +620,13 @@ public:
       genDistributeOp(doLoop.getLoc(), rewriter);
     }
 
-    genParallelOp(doLoop.getLoc(), rewriter, loopNest, mapper,
-                  loopNestClauseOps);
+    mlir::omp::ParallelOp parallelOp = genParallelOp(
+        doLoop.getLoc(), rewriter, loopNest, mapper, loopNestClauseOps);
+
+    for (auto &[local, localDestroyer] : locals)
+      looputils::localizeLocallyDestroyedValue(
+          local, localDestroyer, parallelOp.getRegion(), rewriter, mapper);
+
     mlir::omp::LoopNestOp ompLoopNest =
         genWsLoopOp(rewriter, loopNest.back().first, mapper, loopNestClauseOps);
 
@@ -919,9 +1003,10 @@ public:
         context, mapTo == fir::omp::DoConcurrentMappingKind::DCMK_Device,
         concurrentLoopsToSkip);
     mlir::ConversionTarget target(*context);
-    target.addLegalDialect<fir::FIROpsDialect, hlfir::hlfirDialect,
-                           mlir::arith::ArithDialect, mlir::func::FuncDialect,
-                           mlir::omp::OpenMPDialect>();
+    target.addLegalDialect<
+        fir::FIROpsDialect, hlfir::hlfirDialect, mlir::arith::ArithDialect,
+        mlir::func::FuncDialect, mlir::omp::OpenMPDialect,
+        mlir::cf::ControlFlowDialect, mlir::math::MathDialect>();
 
     target.addDynamicallyLegalOp<fir::DoLoopOp>([&](fir::DoLoopOp op) {
       return !op.getUnordered() || concurrentLoopsToSkip.contains(op);
