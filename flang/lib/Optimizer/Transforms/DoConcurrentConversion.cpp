@@ -472,49 +472,49 @@ void sinkLoopIVArgs(mlir::ConversionPatternRewriter &rewriter,
   }
 }
 
-/// Collects values are that are destroyed by the Fortran runtime within the
-/// loop's scope.
+/// Collects values that are local to a loop: "loop-local values". A loop-local
+/// value is one that is used explicitely inside the loop but allocated outside
+/// of it. This usually corresponds to temporary values that are used inside the
+/// loop body for initialzing other variables for example.
 ///
 /// \param [in] doLoop - the loop within which the function searches for locally
 /// destroyed values.
 ///
-/// \param [out] local - a map from locally destroyed values to the runtime
-/// destroy opertaions that destroy them.
-void collectLocallyDestroyedValuesInLoop(
-    fir::DoLoopOp doLoop,
-    llvm::DenseMap<mlir::Value, mlir::Operation *> &locals) {
-  constexpr static auto destroy{"_FortranADestroy"};
-  doLoop.getRegion().walk([&](fir::CallOp call) {
-    auto callee = call.getCallee();
+/// \param [out] locals - the list of loop-local values detected for \p doLoop.
+void collectLoopLocalValues(fir::DoLoopOp doLoop,
+                            llvm::SetVector<mlir::Value> &locals) {
+  doLoop.walk([&](mlir::Operation *op) {
+    for (mlir::Value operand : op->getOperands()) {
+      bool isLocal = true;
 
-    if (!callee.has_value())
-      return;
+      if (!mlir::isa_and_present<fir::AllocaOp>(operand.getDefiningOp()))
+        continue;
 
-    if (callee.value().getLeafReference().str() != destroy)
-      return;
+      // Values defined inside the loop are not interesting since they do not
+      // need to be localized.
+      if (doLoop->isAncestor(operand.getDefiningOp()))
+        continue;
 
-    assert(call.getNumOperands() == 1);
+      for (auto *user : operand.getUsers()) {
+        if (!doLoop->isAncestor(user)) {
+          isLocal = false;
+          break;
+        }
+      }
 
-    mlir::BackwardSliceOptions options;
-    options.inclusive = true;
-    llvm::SetVector<mlir::Operation *> opSlice;
-    mlir::getBackwardSlice(call, &opSlice, options);
-
-    if (auto alloca = mlir::dyn_cast_if_present<fir::AllocaOp>(opSlice.front()))
-      locals.try_emplace(alloca.getResult(), call);
+      if (isLocal)
+        locals.insert(operand);
+    }
   });
 }
 
-/// For a locally destroyed value \p local within a loop's scope, localizes that
+/// For a "loop-local" value \p local within a loop's scope, localizes that
 /// value within the scope of the parallel region the loop maps to. Towards that
 /// end, this function allocates a private copy of \p local within \p
 /// allocRegion.
 ///
 /// \param local - the locally destroyed value within a loop's scope (see
 /// collectLocallyDestroyedValuesInLoop).
-///
-/// \param localDestroyer - the Fortran runtime call operation that destroys \p
-/// local.
 ///
 /// \param allocRegion - the parallel region where \p local's allocation will be
 /// cloned (i.e. privatized).
@@ -523,21 +523,13 @@ void collectLocallyDestroyedValuesInLoop(
 ///
 /// \param mapper - mapper to track updated references \p local within \p
 /// allocRegion.
-void localizeLocallyDestroyedValue(mlir::Value local,
-                                   mlir::Operation *localDestroyer,
-                                   mlir::Region &allocRegion,
-                                   mlir::ConversionPatternRewriter &rewriter,
-                                   mlir::IRMapping &mapper) {
-  mlir::Region *loopRegion = localDestroyer->getParentRegion();
-  assert(loopRegion != nullptr);
-
+void localizeLoopLocalValue(mlir::Value local, mlir::Region &allocRegion,
+                            mlir::ConversionPatternRewriter &rewriter,
+                            mlir::IRMapping &mapper) {
   mlir::IRRewriter::InsertPoint ip = rewriter.saveInsertionPoint();
   rewriter.setInsertionPointToStart(&allocRegion.front());
   mlir::Operation *newLocalDef = rewriter.clone(*local.getDefiningOp(), mapper);
-  rewriter.replaceUsesWithIf(
-      local, newLocalDef->getResult(0), [&](mlir::OpOperand &operand) {
-        return operand.getOwner()->getParentRegion() == loopRegion;
-      });
+  rewriter.replaceAllUsesWith(local, newLocalDef->getResult(0));
   mapper.map(local, newLocalDef->getResult(0));
 
   rewriter.restoreInsertionPoint(ip);
@@ -595,9 +587,8 @@ public:
 
     mlir::IRMapping mapper;
 
-    llvm::DenseMap<mlir::Value, mlir::Operation *> locals;
-    looputils::collectLocallyDestroyedValuesInLoop(loopNest.back().first,
-                                                   locals);
+    llvm::SetVector<mlir::Value> locals;
+    looputils::collectLoopLocalValues(loopNest.back().first, locals);
 
     looputils::sinkLoopIVArgs(rewriter, loopNest);
 
@@ -623,9 +614,9 @@ public:
     mlir::omp::ParallelOp parallelOp = genParallelOp(
         doLoop.getLoc(), rewriter, loopNest, mapper, loopNestClauseOps);
 
-    for (auto &[local, localDestroyer] : locals)
-      looputils::localizeLocallyDestroyedValue(
-          local, localDestroyer, parallelOp.getRegion(), rewriter, mapper);
+    for (mlir::Value local : locals)
+      looputils::localizeLoopLocalValue(local, parallelOp.getRegion(), rewriter,
+                                        mapper);
 
     mlir::omp::LoopNestOp ompLoopNest =
         genWsLoopOp(rewriter, loopNest.back().first, mapper, loopNestClauseOps);
