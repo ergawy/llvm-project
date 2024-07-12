@@ -240,7 +240,7 @@ exceptions to this are:
      examples above.
   1. any values that are from allocations outside the loop nest and used
      exclusively inside of it. In such cases, a local privatized
-     value is created in the OpenMP region to prevent multiple teams of treads
+     value is created in the OpenMP region to prevent multiple teams of threads
      from accessing and destroying the same memory block which causes runtime
      issues. For an example of such cases, see
      `flang/test/Transforms/DoConcurrent/locally_destroyed_temp.f90`.
