@@ -477,8 +477,8 @@ void sinkLoopIVArgs(mlir::ConversionPatternRewriter &rewriter,
 /// of it. This usually corresponds to temporary values that are used inside the
 /// loop body for initialzing other variables for example.
 ///
-/// \param [in] doLoop - the loop within which the function searches for locally
-/// destroyed values.
+/// \param [in] doLoop - the loop within which the function searches for values
+/// used exclusively inside.
 ///
 /// \param [out] locals - the list of loop-local values detected for \p doLoop.
 void collectLoopLocalValues(fir::DoLoopOp doLoop,
@@ -510,29 +510,18 @@ void collectLoopLocalValues(fir::DoLoopOp doLoop,
 
 /// For a "loop-local" value \p local within a loop's scope, localizes that
 /// value within the scope of the parallel region the loop maps to. Towards that
-/// end, this function allocates a private copy of \p local within \p
-/// allocRegion.
+/// end, this function moves the allocation of \p local within \p allocRegion.
 ///
-/// \param local - the locally destroyed value within a loop's scope (see
-/// collectLocallyDestroyedValuesInLoop).
+/// \param local - the value used exclusively within a loop's scope (see
+/// collectLoopLocalValues).
 ///
 /// \param allocRegion - the parallel region where \p local's allocation will be
-/// cloned (i.e. privatized).
+/// privatized.
 ///
 /// \param rewriter - builder used for updating \p allocRegion.
-///
-/// \param mapper - mapper to track updated references \p local within \p
-/// allocRegion.
 void localizeLoopLocalValue(mlir::Value local, mlir::Region &allocRegion,
-                            mlir::ConversionPatternRewriter &rewriter,
-                            mlir::IRMapping &mapper) {
-  mlir::IRRewriter::InsertPoint ip = rewriter.saveInsertionPoint();
-  rewriter.setInsertionPointToStart(&allocRegion.front());
-  mlir::Operation *newLocalDef = rewriter.clone(*local.getDefiningOp(), mapper);
-  rewriter.replaceAllUsesWith(local, newLocalDef->getResult(0));
-  mapper.map(local, newLocalDef->getResult(0));
-
-  rewriter.restoreInsertionPoint(ip);
+                            mlir::ConversionPatternRewriter &rewriter) {
+  rewriter.moveOpBefore(local.getDefiningOp(), &allocRegion.front().front());
 }
 } // namespace looputils
 
@@ -615,8 +604,8 @@ public:
         doLoop.getLoc(), rewriter, loopNest, mapper, loopNestClauseOps);
 
     for (mlir::Value local : locals)
-      looputils::localizeLoopLocalValue(local, parallelOp.getRegion(), rewriter,
-                                        mapper);
+      looputils::localizeLoopLocalValue(local, parallelOp.getRegion(),
+                                        rewriter);
 
     mlir::omp::LoopNestOp ompLoopNest =
         genWsLoopOp(rewriter, loopNest.back().first, mapper, loopNestClauseOps);

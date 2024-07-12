@@ -239,9 +239,9 @@ exceptions to this are:
      case, for each IV, we allocate a local copy as shown the by the mapping
      examples above.
   1. any values that are from allocations outside the loop nest and used
-     explicitly inside of it. In such cases, a local privatized value is
-     created in the OpenMP region to prevent multiple teams of treads from
-     accessing and destroying the same memory block which causes runtime
+     exclusively inside of it. In such cases, a local privatized
+     value is created in the OpenMP region to prevent multiple teams of treads
+     from accessing and destroying the same memory block which causes runtime
      issues. For an example of such cases, see
      `flang/test/Transforms/DoConcurrent/locally_destroyed_temp.f90`.
 
