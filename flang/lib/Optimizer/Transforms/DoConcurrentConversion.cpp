@@ -473,7 +473,7 @@ void sinkLoopIVArgs(mlir::ConversionPatternRewriter &rewriter,
 }
 
 /// Collects values that are local to a loop: "loop-local values". A loop-local
-/// value is one that is used explicitely inside the loop but allocated outside
+/// value is one that is used exclusively inside the loop but allocated outside
 /// of it. This usually corresponds to temporary values that are used inside the
 /// loop body for initialzing other variables for example.
 ///
@@ -481,10 +481,13 @@ void sinkLoopIVArgs(mlir::ConversionPatternRewriter &rewriter,
 /// used exclusively inside.
 ///
 /// \param [out] locals - the list of loop-local values detected for \p doLoop.
-void collectLoopLocalValues(fir::DoLoopOp doLoop,
-                            llvm::SetVector<mlir::Value> &locals) {
+static void collectLoopLocalValues(fir::DoLoopOp doLoop,
+                                   llvm::SetVector<mlir::Value> &locals) {
   doLoop.walk([&](mlir::Operation *op) {
     for (mlir::Value operand : op->getOperands()) {
+      if (locals.contains(operand))
+        continue;
+
       bool isLocal = true;
 
       if (!mlir::isa_and_present<fir::AllocaOp>(operand.getDefiningOp()))
@@ -519,7 +522,7 @@ void collectLoopLocalValues(fir::DoLoopOp doLoop,
 /// privatized.
 ///
 /// \param rewriter - builder used for updating \p allocRegion.
-void localizeLoopLocalValue(mlir::Value local, mlir::Region &allocRegion,
+static void localizeLoopLocalValue(mlir::Value local, mlir::Region &allocRegion,
                             mlir::ConversionPatternRewriter &rewriter) {
   rewriter.moveOpBefore(local.getDefiningOp(), &allocRegion.front().front());
 }
